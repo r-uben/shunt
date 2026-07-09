@@ -1,12 +1,24 @@
 use axum::http::StatusCode;
 use serde::Deserialize;
 
-use crate::{config::Config, error::ShuntError};
+use crate::{
+    config::{Config, ProviderKind},
+    error::ShuntError,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterKind {
     Anthropic,
     Responses,
+}
+
+impl From<ProviderKind> for AdapterKind {
+    fn from(kind: ProviderKind) -> Self {
+        match kind {
+            ProviderKind::Anthropic => AdapterKind::Anthropic,
+            ProviderKind::Responses => AdapterKind::Responses,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,20 +73,13 @@ fn route_for(
     upstream_model: &str,
     effort: Option<String>,
 ) -> Route {
-    let adapter = if matches!(provider, "openai" | "codex" | "chatgpt") {
-        AdapterKind::Responses
-    } else {
-        AdapterKind::Anthropic
-    };
-    let effort = effort.or_else(|| {
-        if provider == "openai" {
-            config.providers.openai.effort.clone()
-        } else if matches!(provider, "codex" | "chatgpt") {
-            config.providers.codex.effort.clone()
-        } else {
-            None
-        }
-    });
+    // The provider's declared kind picks the adapter; unknown names (only
+    // reachable via a validated default) fall back to the Anthropic passthrough.
+    let provider_config = config.provider(provider);
+    let adapter = provider_config
+        .map(|p| AdapterKind::from(p.kind))
+        .unwrap_or(AdapterKind::Anthropic);
+    let effort = effort.or_else(|| provider_config.and_then(|p| p.effort.clone()));
     Route {
         provider: provider.to_string(),
         adapter,
@@ -116,7 +121,7 @@ mod tests {
     #[test]
     fn codex_routes_use_responses_adapter_and_codex_effort() {
         let mut config = Config::default();
-        config.providers.codex.effort = Some("high".to_string());
+        config.providers.get_mut("codex").unwrap().effort = Some("high".to_string());
         config.route_prefixes = vec![RoutePrefixConfig {
             prefix: "gpt-".to_string(),
             provider: "codex".to_string(),

@@ -2,7 +2,12 @@ use std::{env, path::PathBuf};
 
 use axum::{http::StatusCode, response::IntoResponse};
 
-use crate::{adapters::AdapterError, config::Config, error::ShuntError, routing::Route};
+use crate::{
+    adapters::AdapterError,
+    config::{ApiKeyHeader, AuthMode, Config, ProviderConfig},
+    error::ShuntError,
+    routing::Route,
+};
 
 pub mod claude_auth;
 pub mod codex_auth;
@@ -12,21 +17,32 @@ pub mod codex_auth;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credential {
-    ApiKey(String),
+    /// Forward the client's own credential unchanged (Anthropic passthrough).
+    Passthrough,
+    /// Inject an API key, sent in the given header.
+    ApiKey { value: String, header: ApiKeyHeader },
     ChatGptOAuth {
         access_token: String,
         account_id: String,
     },
 }
 
+/// Resolve the credential for a route from its provider's configured `auth`.
 pub async fn resolve_credential(
     config: &Config,
     route: &Route,
     client: &reqwest::Client,
 ) -> Result<Credential, AdapterError> {
-    match route.provider.as_str() {
-        "openai" => resolve_openai(config).map(Credential::ApiKey),
-        "codex" | "chatgpt" => {
+    let provider = config
+        .provider(&route.provider)
+        .ok_or_else(|| auth_error(format!("unknown provider {}", route.provider)))?;
+    match provider.auth {
+        AuthMode::Passthrough => Ok(Credential::Passthrough),
+        AuthMode::ApiKey => Ok(Credential::ApiKey {
+            value: resolve_api_key(&route.provider, provider)?,
+            header: provider.api_key_header,
+        }),
+        AuthMode::ChatgptOauth => {
             let store = codex_auth::CodexAuthStore::new(default_codex_auth_path(), client.clone());
             store
                 .get_valid_chatgpt()
@@ -36,29 +52,32 @@ pub async fn resolve_credential(
                     account_id: credential.account_id,
                 })
         }
-        provider => Err(auth_error(format!(
-            "responses adapter does not support provider {provider}"
-        ))),
     }
 }
 
-pub fn resolve_openai(config: &Config) -> Result<String, AdapterError> {
-    if let Ok(value) = env::var("OPENAI_API_KEY") {
+/// Read an `auth = "api_key"` provider's key from its `api_key_env`. As a
+/// convenience the built-in OpenAI provider also falls back to the key inside
+/// ~/.codex/auth.json when `OPENAI_API_KEY` is unset.
+fn resolve_api_key(name: &str, provider: &ProviderConfig) -> Result<String, AdapterError> {
+    let env_name = provider.api_key_env.as_deref().ok_or_else(|| {
+        auth_error(format!(
+            "provider {name} uses auth = \"api_key\" but api_key_env is not set"
+        ))
+    })?;
+
+    if let Ok(value) = env::var(env_name) {
         if !value.is_empty() {
             return Ok(value);
         }
     }
 
-    if let Some(value) = codex_auth::read_openai_api_key(&default_codex_auth_path()) {
-        return Ok(value);
+    if env_name == "OPENAI_API_KEY" {
+        if let Some(value) = codex_auth::read_openai_api_key(&default_codex_auth_path()) {
+            return Ok(value);
+        }
     }
 
-    env::var(&config.providers.openai.api_key_env).map_err(|_| {
-        auth_error(format!(
-            "{} is not set",
-            config.providers.openai.api_key_env
-        ))
-    })
+    Err(auth_error(format!("{env_name} is not set")))
 }
 
 pub fn auth_error(message: impl Into<String>) -> AdapterError {
@@ -82,12 +101,9 @@ fn default_codex_auth_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        config::Config,
-        routing::{AdapterKind, Route},
-    };
+    use crate::config::Config;
 
-    use super::resolve_openai;
+    use super::resolve_api_key;
 
     #[test]
     fn resolves_openai_key_from_codex_auth_json_when_env_missing() {
@@ -108,7 +124,8 @@ mod tests {
         std::env::remove_var("OPENAI_API_KEY");
         std::env::set_var("CODEX_AUTH_FILE", &auth_file);
 
-        let key = resolve_openai(&Config::default()).unwrap();
+        let config = Config::default();
+        let key = resolve_api_key("openai", config.provider("openai").unwrap()).unwrap();
 
         assert_eq!(key, "file-key");
         std::env::remove_var("CODEX_AUTH_FILE");
@@ -116,15 +133,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_route_uses_responses_auth_path() {
-        let route = Route {
-            provider: "codex".to_string(),
-            adapter: AdapterKind::Responses,
-            model: "gpt-5.2-codex".to_string(),
-            upstream_model: "gpt-5.2-codex".to_string(),
-            effort: None,
-        };
-
-        assert_eq!(route.provider, "codex");
+    fn api_key_provider_requires_env_var() {
+        let config = Config::default();
+        // A fresh temp env with no key set and no codex fallback for a non-openai
+        // env var name must error rather than silently pass.
+        std::env::remove_var("SHUNT_TEST_MISSING_KEY");
+        let mut provider = config.provider("openai").unwrap().clone();
+        provider.api_key_env = Some("SHUNT_TEST_MISSING_KEY".to_string());
+        assert!(resolve_api_key("kimi", &provider).is_err());
     }
 }

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::Path};
+use std::{collections::BTreeMap, net::SocketAddr, path::Path};
 
 use figment::{
     providers::{Env, Format, Serialized, Toml},
@@ -19,6 +19,12 @@ pub struct Config {
     pub route_prefixes: Vec<RoutePrefixConfig>,
 }
 
+/// Providers are a name → config map, so a new upstream is just another
+/// `[providers.<name>]` table — no code change. figment deep-merges the map, so
+/// a partial `[providers.codex]` in shunt.toml overrides only the fields it sets
+/// while the built-in defaults (anthropic/openai/codex) fill the rest.
+pub type ProvidersConfig = BTreeMap<String, ProviderConfig>;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub bind: String,
@@ -26,39 +32,59 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ProvidersConfig {
-    pub anthropic: AnthropicConfig,
-    pub openai: OpenAiConfig,
-    pub codex: CodexConfig,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct AnthropicConfig {
+pub struct ProviderConfig {
+    /// Which protocol the upstream speaks, i.e. which adapter handles it.
+    pub kind: ProviderKind,
     pub base_url: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct OpenAiConfig {
-    pub adapter: String,
-    pub base_url: String,
-    pub api_key_env: String,
-    pub auth: ProviderAuth,
+    /// How shunt authenticates to this upstream.
+    #[serde(default)]
+    pub auth: AuthMode,
+    /// Env var holding the API key, when `auth = "api_key"`.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Header the API key is sent in, when `auth = "api_key"`.
+    #[serde(default)]
+    pub api_key_header: ApiKeyHeader,
+    /// Optional default reasoning effort for `kind = "responses"` providers.
+    #[serde(default)]
     pub effort: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CodexConfig {
-    pub adapter: String,
-    pub base_url: String,
-    pub auth: ProviderAuth,
-    pub effort: Option<String>,
-}
-
+/// The upstream protocol / adapter a provider uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProviderAuth {
+pub enum ProviderKind {
+    /// Anthropic Messages API — passed through, optionally re-keyed. Covers
+    /// api.anthropic.com and every Anthropic-compatible gateway (Kimi, DeepSeek,
+    /// Z.ai, MiniMax, Mimo, OpenRouter, Vercel AI Gateway, …).
+    Anthropic,
+    /// OpenAI Responses API — Anthropic Messages are translated to it (OpenAI,
+    /// ChatGPT/Codex).
+    Responses,
+}
+
+/// How shunt authenticates to an upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Forward the client's own credential unchanged (api.anthropic.com).
+    #[default]
+    Passthrough,
+    /// Inject an API key read from `api_key_env`.
     ApiKey,
+    /// Reuse the ChatGPT/Codex OAuth login in ~/.codex/auth.json.
     ChatgptOauth,
+}
+
+/// Which header an injected API key is sent in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyHeader {
+    /// `Authorization: Bearer <key>` (most gateways; also `ANTHROPIC_AUTH_TOKEN`).
+    #[default]
+    Bearer,
+    /// `x-api-key: <key>` (Anthropic-native style; Vercel AI Gateway).
+    XApiKey,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -87,55 +113,69 @@ pub enum ConfigError {
     Figment(#[from] Box<figment::Error>),
     #[error("server.bind must be a socket address: {0}")]
     BindAddress(#[from] std::net::AddrParseError),
-    #[error("providers.anthropic.base_url must be a valid absolute URL: {0}")]
-    BaseUrl(String),
-    #[error("providers.anthropic.base_url must include a scheme and host")]
-    BaseUrlMissingHost,
-    #[error("{provider}.base_url must be a valid absolute URL: {message}")]
+    #[error("providers.{provider}.base_url must be a valid absolute URL: {message}")]
     ProviderBaseUrl { provider: String, message: String },
-    #[error("{provider}.base_url must include a scheme and host")]
+    #[error("providers.{provider}.base_url must include a scheme and host")]
     ProviderBaseUrlMissingHost { provider: String },
+    #[error("providers.{provider} uses auth = \"api_key\" but api_key_env is not set")]
+    MissingApiKeyEnv { provider: String },
     #[error("server.default_provider references unknown provider: {0}")]
     UnknownDefaultProvider(String),
     #[error("route for model {model} references unknown provider: {provider}")]
     UnknownRouteProvider { model: String, provider: String },
     #[error("route prefix {prefix} references unknown provider: {provider}")]
     UnknownPrefixProvider { prefix: String, provider: String },
-    #[error("providers.openai.adapter must be responses")]
-    OpenAiAdapter,
-    #[error("providers.codex.adapter must be responses")]
-    CodexAdapter,
-    #[error("providers.openai.auth must be api_key")]
-    OpenAiAuth,
-    #[error("providers.codex.auth must be chatgpt_oauth")]
-    CodexAuth,
+}
+
+impl ProviderConfig {
+    fn anthropic(base_url: &str) -> Self {
+        Self {
+            kind: ProviderKind::Anthropic,
+            base_url: base_url.to_string(),
+            auth: AuthMode::Passthrough,
+            api_key_env: None,
+            api_key_header: ApiKeyHeader::Bearer,
+            effort: None,
+        }
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
+        let providers = ProvidersConfig::from([
+            (
+                "anthropic".to_string(),
+                ProviderConfig::anthropic("https://api.anthropic.com"),
+            ),
+            (
+                "openai".to_string(),
+                ProviderConfig {
+                    kind: ProviderKind::Responses,
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    auth: AuthMode::ApiKey,
+                    api_key_env: Some("OPENAI_API_KEY".to_string()),
+                    api_key_header: ApiKeyHeader::Bearer,
+                    effort: None,
+                },
+            ),
+            (
+                "codex".to_string(),
+                ProviderConfig {
+                    kind: ProviderKind::Responses,
+                    base_url: "https://chatgpt.com/backend-api".to_string(),
+                    auth: AuthMode::ChatgptOauth,
+                    api_key_env: None,
+                    api_key_header: ApiKeyHeader::Bearer,
+                    effort: None,
+                },
+            ),
+        ]);
         Self {
             server: ServerConfig {
                 bind: "127.0.0.1:3001".to_string(),
                 default_provider: "anthropic".to_string(),
             },
-            providers: ProvidersConfig {
-                anthropic: AnthropicConfig {
-                    base_url: "https://api.anthropic.com".to_string(),
-                },
-                openai: OpenAiConfig {
-                    adapter: "responses".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    api_key_env: "OPENAI_API_KEY".to_string(),
-                    auth: ProviderAuth::ApiKey,
-                    effort: None,
-                },
-                codex: CodexConfig {
-                    adapter: "responses".to_string(),
-                    base_url: "https://chatgpt.com/backend-api".to_string(),
-                    auth: ProviderAuth::ChatgptOauth,
-                    effort: None,
-                },
-            },
+            providers,
             models: Vec::new(),
             routes: Vec::new(),
             route_prefixes: Vec::new(),
@@ -156,20 +196,19 @@ impl Config {
 
     pub fn validate(self) -> Result<Self, ConfigError> {
         self.server.bind_addr()?;
-        self.anthropic_base_url()?;
-        self.openai_base_url()?;
-        self.codex_base_url()?;
-        if self.providers.openai.adapter != "responses" {
-            return Err(ConfigError::OpenAiAdapter);
-        }
-        if self.providers.codex.adapter != "responses" {
-            return Err(ConfigError::CodexAdapter);
-        }
-        if self.providers.openai.auth != ProviderAuth::ApiKey {
-            return Err(ConfigError::OpenAiAuth);
-        }
-        if self.providers.codex.auth != ProviderAuth::ChatgptOauth {
-            return Err(ConfigError::CodexAuth);
+        for (name, provider) in &self.providers {
+            self.provider_base_url(name, &provider.base_url)?;
+            if provider.auth == AuthMode::ApiKey
+                && provider
+                    .api_key_env
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err(ConfigError::MissingApiKeyEnv {
+                    provider: name.clone(),
+                });
+            }
         }
         if !self.has_provider(&self.server.default_provider) {
             return Err(ConfigError::UnknownDefaultProvider(
@@ -203,21 +242,9 @@ impl Config {
         Ok(self)
     }
 
-    pub fn anthropic_base_url(&self) -> Result<reqwest::Url, ConfigError> {
-        let url = reqwest::Url::parse(&self.providers.anthropic.base_url)
-            .map_err(|error| ConfigError::BaseUrl(error.to_string()))?;
-        if url.scheme().is_empty() || url.host_str().is_none() {
-            return Err(ConfigError::BaseUrlMissingHost);
-        }
-        Ok(url)
-    }
-
-    pub fn openai_base_url(&self) -> Result<reqwest::Url, ConfigError> {
-        self.provider_base_url("providers.openai", &self.providers.openai.base_url)
-    }
-
-    pub fn codex_base_url(&self) -> Result<reqwest::Url, ConfigError> {
-        self.provider_base_url("providers.codex", &self.providers.codex.base_url)
+    /// Look up a provider by name.
+    pub fn provider(&self, name: &str) -> Option<&ProviderConfig> {
+        self.providers.get(name)
     }
 
     pub fn provider_base_url(
@@ -238,7 +265,7 @@ impl Config {
     }
 
     fn has_provider(&self, provider: &str) -> bool {
-        matches!(provider, "anthropic" | "openai" | "codex" | "chatgpt")
+        self.providers.contains_key(provider)
     }
 }
 
@@ -255,7 +282,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use super::{Config, ModelConfig};
+    use super::{AuthMode, Config, ModelConfig, ProviderKind};
 
     struct BufferWriter {
         buffer: Arc<Mutex<Vec<u8>>>,
@@ -298,5 +325,69 @@ mod tests {
 
         assert!(logs.contains("configured discovery model has no matching route"));
         assert!(logs.contains("claude-opus-via-codex"));
+    }
+
+    #[test]
+    fn default_seeds_builtin_providers() {
+        let config = Config::default();
+        assert_eq!(
+            config.provider("anthropic").unwrap().kind,
+            ProviderKind::Anthropic
+        );
+        assert_eq!(
+            config.provider("openai").unwrap().kind,
+            ProviderKind::Responses
+        );
+        assert_eq!(
+            config.provider("codex").unwrap().auth,
+            AuthMode::ChatgptOauth
+        );
+        assert!(config.provider("kimi").is_none());
+    }
+
+    #[test]
+    fn toml_adds_a_provider_and_merges_builtin_overrides() {
+        let dir = std::env::temp_dir().join(format!(
+            "shunt-config-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shunt.toml");
+        std::fs::write(
+            &path,
+            r#"
+[providers.kimi]
+kind = "anthropic"
+base_url = "https://api.moonshot.ai/anthropic"
+auth = "api_key"
+api_key_env = "KIMI_API_KEY"
+
+[providers.codex]
+effort = "high"
+
+[[routes]]
+model = "kimi-k2.7-code"
+provider = "kimi"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(Some(&path)).unwrap();
+
+        // New provider added from TOML.
+        let kimi = config.provider("kimi").unwrap();
+        assert_eq!(kimi.kind, ProviderKind::Anthropic);
+        assert_eq!(kimi.auth, AuthMode::ApiKey);
+        assert_eq!(kimi.api_key_env.as_deref(), Some("KIMI_API_KEY"));
+        // Built-in codex kept its default base_url/auth while gaining effort.
+        let codex = config.provider("codex").unwrap();
+        assert_eq!(codex.base_url, "https://chatgpt.com/backend-api");
+        assert_eq!(codex.auth, AuthMode::ChatgptOauth);
+        assert_eq!(codex.effort.as_deref(), Some("high"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -61,19 +61,22 @@ cp shunt.toml.example shunt.toml
 bind = "127.0.0.1:3001"        # address shunt listens on
 default_provider = "anthropic" # provider for any model with no route (pass-through)
 
+# Each provider is a [providers.<name>] table (see §3.3 for every key).
 [providers.anthropic]
+kind = "anthropic"             # forward Claude Code's own credential unchanged
 base_url = "https://api.anthropic.com"
 
 [providers.openai]
-adapter = "responses"          # must be "responses"
+kind = "responses"             # translate Anthropic Messages -> OpenAI Responses
 base_url = "https://api.openai.com/v1"
+auth = "api_key"
 api_key_env = "OPENAI_API_KEY" # env var the OpenAI key is read from
 # effort = "high"              # optional default reasoning effort for this provider
 
 [providers.codex]
-adapter = "responses"          # must be "responses"
+kind = "responses"
 base_url = "https://chatgpt.com/backend-api"
-# auth = "chatgpt_oauth"       # (default) reuses ~/.codex/auth.json
+auth = "chatgpt_oauth"         # reuses ~/.codex/auth.json
 # effort = "high"
 
 # --- Routing: how a request's `model` id picks a provider ---
@@ -100,7 +103,56 @@ provider = "openai"
 **Routing precedence** (`src/routing.rs`): exact `[[routes]]` match → `[[route_prefixes]]`
 prefix match → `server.default_provider`. A model with no match falls through to Anthropic.
 
-### 3.2 Validate the config
+### 3.2 Adding a provider
+
+Providers are a **name → config map**, so a new upstream is just another `[providers.<name>]`
+table — **no code change**. figment deep-merges the map, so a partial override of a built-in
+(e.g. only `[providers.codex] effort = "high"`) keeps the rest of that provider's defaults, while
+a brand-new table adds a provider. Every provider takes these keys:
+
+| Key | Values | Meaning |
+| :-- | :-- | :-- |
+| `kind` | `anthropic` \| `responses` | Upstream protocol / adapter. `anthropic` = Messages API (passed through, optionally re-keyed); `responses` = Anthropic Messages translated to the OpenAI Responses API. |
+| `base_url` | URL | Upstream base; Claude Code appends `/v1/messages`. |
+| `auth` | `passthrough` \| `api_key` \| `chatgpt_oauth` | `passthrough` forwards the client's own credential (api.anthropic.com); `api_key` injects a key from `api_key_env`; `chatgpt_oauth` reuses `~/.codex/auth.json`. |
+| `api_key_env` | env var name | Where the key is read from, when `auth = "api_key"`. |
+| `api_key_header` | `bearer` (default) \| `x_api_key` | Header the injected key is sent in. |
+| `effort` | `low`…`max` | Optional default reasoning effort (`responses` providers). |
+
+Most third-party "use Claude Code with X" gateways are **Anthropic-Messages-compatible**: they are
+`kind = "anthropic"` with `auth = "api_key"`, differing only in `base_url` and the key env var.
+shunt injects the key and forwards the request. Ready-to-use entries (uncomment in
+`shunt.toml.example`, set the env var, add a `[[routes]]` line):
+
+| Provider | `base_url` | Example model IDs |
+| :-- | :-- | :-- |
+| Kimi (Moonshot) | `https://api.moonshot.ai/anthropic` | `kimi-k2.7-code` |
+| DeepSeek | `https://api.deepseek.com/anthropic` | `deepseek-v4-pro`, `deepseek-v4-flash` |
+| Z.ai (GLM) | `https://api.z.ai/api/anthropic` | `glm-5.2`, `glm-4.7` |
+| MiniMax | `https://api.minimax.io/anthropic` | see [MiniMax docs](https://platform.minimax.io/docs/token-plan/claude-code) |
+| Mimo (Xiaomi) | `https://api-mimo.mi.com/anthropic` | see [Mimo docs](https://mimo.mi.com/docs/en-US/tokenplan/integration/claudecode) |
+| OpenRouter | `https://openrouter.ai/api` | `anthropic/claude-opus-4.8`, `~anthropic/claude-sonnet-latest` |
+| Vercel AI Gateway | `https://ai-gateway.vercel.sh` | `anthropic/claude-opus-4.8` (accepts `x_api_key`) |
+
+For example, to route Kimi's model through shunt:
+
+```toml
+[providers.kimi]
+kind = "anthropic"
+base_url = "https://api.moonshot.ai/anthropic"
+auth = "api_key"
+api_key_env = "KIMI_API_KEY"
+
+[[routes]]
+model = "kimi-k2.7-code"
+provider = "kimi"
+```
+
+Then `export KIMI_API_KEY=…`, point Claude Code at shunt (§5.1), and select `kimi-k2.7-code`
+(via `ANTHROPIC_MODEL` or the `/model` picker). Run `shunt check` to validate — it reports an
+unknown provider in a route, a missing `api_key_env`, or a bad `base_url`.
+
+### 3.3 Validate the config
 
 ```bash
 cargo run -- check            # or: shunt check   /   shunt --check

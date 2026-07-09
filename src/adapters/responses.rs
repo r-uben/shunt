@@ -173,8 +173,10 @@ fn request_builder(
         .header("OpenAI-Beta", "responses=experimental")
         .header("content-type", "application/json");
     match credential {
-        Credential::ApiKey(api_key) => {
-            request = request.bearer_auth(api_key);
+        // The Responses API is always Bearer-authenticated; the configured
+        // api_key_header only governs the Anthropic passthrough adapter.
+        Credential::ApiKey { value, .. } => {
+            request = request.bearer_auth(value);
         }
         Credential::ChatGptOAuth {
             access_token,
@@ -185,17 +187,25 @@ fn request_builder(
                 .header("chatgpt-account-id", account_id)
                 .header("originator", "codex_cli_rs");
         }
+        // A Responses provider configured with passthrough auth is a
+        // misconfiguration; send no credential and let the upstream reject it.
+        Credential::Passthrough => {}
     }
     request
 }
 
 pub fn responses_url(config: &crate::config::Config, provider: &str) -> String {
-    let base = match provider {
-        "codex" | "chatgpt" => &config.providers.codex.base_url,
-        _ => &config.providers.openai.base_url,
-    }
-    .trim_end_matches('/');
-    if matches!(provider, "codex" | "chatgpt") {
+    let provider = config.provider(provider);
+    let base = provider
+        .map(|provider| provider.base_url.as_str())
+        .unwrap_or("https://api.openai.com/v1")
+        .trim_end_matches('/');
+    // The ChatGPT/Codex backend serves the Responses API under /codex/responses;
+    // a plain OpenAI-compatible upstream uses /responses.
+    let chatgpt = provider
+        .map(|provider| provider.auth == crate::config::AuthMode::ChatgptOauth)
+        .unwrap_or(false);
+    if chatgpt {
         format!("{base}/codex/responses")
     } else {
         format!("{base}/responses")

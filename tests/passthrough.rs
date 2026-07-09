@@ -1,13 +1,7 @@
 use std::{io::ErrorKind, net::SocketAddr, time::Duration};
 
 use reqwest::StatusCode;
-use shunt::{
-    config::{
-        AnthropicConfig, CodexConfig, Config, OpenAiConfig, ProviderAuth, ProvidersConfig,
-        ServerConfig,
-    },
-    server,
-};
+use shunt::{config::Config, server};
 use tokio::task::JoinHandle;
 use wiremock::{
     matchers::{body_string_contains, header, method, path, query_param},
@@ -43,33 +37,10 @@ impl Drop for TestGateway {
 }
 
 async fn start_gateway(upstream_base_url: String) -> TestGateway {
-    let config = Config {
-        server: ServerConfig {
-            bind: "127.0.0.1:0".to_string(),
-            default_provider: "anthropic".to_string(),
-        },
-        providers: ProvidersConfig {
-            anthropic: AnthropicConfig {
-                base_url: upstream_base_url,
-            },
-            openai: OpenAiConfig {
-                adapter: "responses".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key_env: "OPENAI_API_KEY".to_string(),
-                auth: ProviderAuth::ApiKey,
-                effort: None,
-            },
-            codex: CodexConfig {
-                adapter: "responses".to_string(),
-                base_url: "https://chatgpt.com/backend-api".to_string(),
-                auth: ProviderAuth::ChatgptOauth,
-                effort: None,
-            },
-        },
-        models: Vec::new(),
-        routes: Vec::new(),
-        route_prefixes: Vec::new(),
-    };
+    // Default providers, but point the anthropic passthrough at the mock upstream.
+    let mut config = Config::default();
+    config.server.bind = "127.0.0.1:0".to_string();
+    config.providers.get_mut("anthropic").unwrap().base_url = upstream_base_url;
     let listener = tokio::net::TcpListener::bind(config.server.bind_addr().unwrap())
         .await
         .unwrap();

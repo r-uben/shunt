@@ -7,22 +7,83 @@
 bind = "127.0.0.1:3001"        # address shunt listens on (ANTHROPIC_BASE_URL points here)
 default_provider = "anthropic" # provider for any model with no route -> pass-through to Anthropic
 
+# --- Providers: each is a `[providers.<name>]` table. Add a new upstream by
+# adding a table — no code change. Every provider has these keys:
+#   kind           = "anthropic" | "responses"   (which upstream protocol)
+#   base_url       = "https://…"                  (Claude Code appends /v1/messages)
+#   auth           = "passthrough" | "api_key" | "chatgpt_oauth"
+#   api_key_env    = "ENV_NAME"                   (when auth = "api_key")
+#   api_key_header = "bearer" | "x_api_key"       (default bearer)
+#   effort         = "low|medium|high|xhigh|max"  (optional; responses providers)
+# The three below are built-in defaults; you only need the keys you change.
+
+# Anthropic itself: forward Claude Code's own credential unchanged.
 [providers.anthropic]
+kind = "anthropic"
 base_url = "https://api.anthropic.com"
+# auth = "passthrough"         # (default)
 
 # OpenAI API (real OpenAI, authenticated with an API key).
 [providers.openai]
-adapter = "responses"          # must be "responses"
+kind = "responses"
 base_url = "https://api.openai.com/v1"
+auth = "api_key"
 api_key_env = "OPENAI_API_KEY" # env var shunt reads the key from
 # effort = "high"              # optional default reasoning effort (low|medium|high|xhigh|max)
 
 # ChatGPT / Codex subscription (reuses ~/.codex/auth.json — run `codex login`).
 [providers.codex]
-adapter = "responses"          # must be "responses"
+kind = "responses"
 base_url = "https://chatgpt.com/backend-api"
-# auth = "chatgpt_oauth"       # default; reads + auto-refreshes ~/.codex/auth.json
+auth = "chatgpt_oauth"         # reads + auto-refreshes ~/.codex/auth.json
 # effort = "high"              # low|medium|high|xhigh; gpt-5.6 slugs also accept "max"
+
+# --- Anthropic-compatible gateways: all `kind = "anthropic"` + an injected key.
+# Uncomment one, set its api_key_env, then add a matching [[routes]] below.
+# (Each provider's own model IDs are shown in a comment.)
+
+# [providers.kimi]              # kimi-k2.7-code
+# kind = "anthropic"
+# base_url = "https://api.moonshot.ai/anthropic"
+# auth = "api_key"
+# api_key_env = "KIMI_API_KEY"
+
+# [providers.deepseek]          # deepseek-v4-pro, deepseek-v4-flash
+# kind = "anthropic"
+# base_url = "https://api.deepseek.com/anthropic"
+# auth = "api_key"
+# api_key_env = "DEEPSEEK_API_KEY"
+
+# [providers.zai]               # glm-5.2, glm-4.7
+# kind = "anthropic"
+# base_url = "https://api.z.ai/api/anthropic"
+# auth = "api_key"
+# api_key_env = "ZAI_API_KEY"
+
+# [providers.minimax]           # see https://platform.minimax.io/docs/token-plan/claude-code
+# kind = "anthropic"
+# base_url = "https://api.minimax.io/anthropic"
+# auth = "api_key"
+# api_key_env = "MINIMAX_API_KEY"
+
+# [providers.mimo]              # see https://mimo.mi.com/docs/en-US/tokenplan/integration/claudecode
+# kind = "anthropic"
+# base_url = "https://api-mimo.mi.com/anthropic"
+# auth = "api_key"
+# api_key_env = "MIMO_API_KEY"
+
+# [providers.openrouter]        # e.g. anthropic/claude-opus-4.8, ~anthropic/claude-sonnet-latest
+# kind = "anthropic"
+# base_url = "https://openrouter.ai/api"
+# auth = "api_key"
+# api_key_env = "OPENROUTER_API_KEY"
+
+# [providers.vercel]            # e.g. anthropic/claude-opus-4.8 (Vercel AI Gateway)
+# kind = "anthropic"
+# base_url = "https://ai-gateway.vercel.sh"
+# auth = "api_key"
+# api_key_env = "AI_GATEWAY_API_KEY"
+# api_key_header = "x_api_key"  # Vercel accepts bearer too; x-api-key is native
 
 # --- Routing: a request's `model` id picks the provider ---
 # Precedence: exact [[routes]] match -> [[route_prefixes]] -> server.default_provider.
@@ -44,6 +105,13 @@ provider = "openai"
 # [[routes]]
 # model = "gpt-5.6-sol"
 # provider = "codex"
+
+# Example C — route to an Anthropic-compatible gateway (see the providers above).
+# The model id is whatever that gateway expects; select it in Claude Code with
+# ANTHROPIC_MODEL / the /model picker. shunt injects the provider's api_key_env.
+# [[routes]]
+# model = "kimi-k2.7-code"
+# provider = "kimi"
 
 # Catch-all: send every gpt-* id to a provider.
 [[route_prefixes]]

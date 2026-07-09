@@ -1,11 +1,13 @@
 use axum::{
     body::Body,
-    http::{HeaderMap, Response, StatusCode, Uri},
+    http::{HeaderMap, HeaderValue, Response, StatusCode, Uri},
     response::IntoResponse,
 };
 
 use crate::{
     adapters::{Adapter, AdapterError, AdapterFuture},
+    auth::{resolve_credential, Credential},
+    config::ApiKeyHeader,
     error::UpstreamError,
     headers,
     routing::Route,
@@ -18,25 +20,28 @@ impl Adapter for AnthropicAdapter {
     fn forward<'a>(
         &'a self,
         state: AppState,
-        _route: Route,
+        route: Route,
         uri: &'a Uri,
         headers: &'a HeaderMap,
         body: Vec<u8>,
     ) -> AdapterFuture<'a> {
-        Box::pin(async move { forward(state, uri, headers, body).await })
+        Box::pin(async move { forward(state, route, uri, headers, body).await })
     }
 }
 
 async fn forward(
     state: AppState,
+    route: Route,
     uri: &Uri,
     headers: &HeaderMap,
     body: Vec<u8>,
 ) -> Result<(StatusCode, axum::response::Response), AdapterError> {
+    let credential = resolve_credential(&state.config, &route, &state.http_client).await?;
+    let request_headers = outbound_headers(headers, &credential);
     let upstream = state
         .http_client
-        .post(upstream_url(&state, uri))
-        .headers(headers::filtered(headers))
+        .post(upstream_url(&state, &route, uri))
+        .headers(request_headers)
         .body(body)
         .send()
         .await
@@ -59,12 +64,37 @@ async fn forward(
     Ok((status, response))
 }
 
-fn upstream_url(state: &AppState, uri: &Uri) -> String {
+/// Build the headers sent upstream. For a passthrough provider (api.anthropic.com)
+/// the client's own credential is forwarded unchanged. For an api-key provider
+/// (Kimi, DeepSeek, Z.ai, OpenRouter, Vercel, …) the client's auth headers are
+/// stripped and replaced with the provider's key in its configured header.
+fn outbound_headers(headers: &HeaderMap, credential: &Credential) -> HeaderMap {
+    let mut out = headers::filtered(headers);
+    if let Credential::ApiKey { value, header } = credential {
+        out.remove("authorization");
+        out.remove("x-api-key");
+        match header {
+            ApiKeyHeader::Bearer => {
+                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {value}")) {
+                    out.insert("authorization", value);
+                }
+            }
+            ApiKeyHeader::XApiKey => {
+                if let Ok(value) = HeaderValue::from_str(value) {
+                    out.insert("x-api-key", value);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn upstream_url(state: &AppState, route: &Route, uri: &Uri) -> String {
     let base = state
         .config
-        .providers
-        .anthropic
-        .base_url
+        .provider(&route.provider)
+        .map(|provider| provider.base_url.as_str())
+        .unwrap_or("https://api.anthropic.com")
         .trim_end_matches('/');
     let path_and_query = uri
         .path_and_query()
@@ -78,5 +108,56 @@ fn upstream_error(error: reqwest::Error) -> AdapterError {
     AdapterError {
         message,
         response: Box::new(UpstreamError::from_reqwest(error).into_response()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::HeaderMap;
+
+    use crate::config::ApiKeyHeader;
+
+    use super::{outbound_headers, Credential};
+
+    fn client_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer client-token".parse().unwrap());
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn passthrough_forwards_client_credential_unchanged() {
+        let out = outbound_headers(&client_headers(), &Credential::Passthrough);
+        assert_eq!(out.get("authorization").unwrap(), "Bearer client-token");
+        assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
+    }
+
+    #[test]
+    fn api_key_bearer_replaces_client_credential() {
+        let out = outbound_headers(
+            &client_headers(),
+            &Credential::ApiKey {
+                value: "provider-key".to_string(),
+                header: ApiKeyHeader::Bearer,
+            },
+        );
+        assert_eq!(out.get("authorization").unwrap(), "Bearer provider-key");
+        assert!(out.get("x-api-key").is_none());
+        // Non-auth client headers still pass through.
+        assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
+    }
+
+    #[test]
+    fn api_key_x_api_key_replaces_client_credential() {
+        let out = outbound_headers(
+            &client_headers(),
+            &Credential::ApiKey {
+                value: "provider-key".to_string(),
+                header: ApiKeyHeader::XApiKey,
+            },
+        );
+        assert_eq!(out.get("x-api-key").unwrap(), "provider-key");
+        assert!(out.get("authorization").is_none());
     }
 }
