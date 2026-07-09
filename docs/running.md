@@ -232,6 +232,31 @@ cached/built-in list — run `claude --debug` and look for `[gatewayDiscovery]` 
 it ran. For `gpt-*` ids without an alias, use `ANTHROPIC_CUSTOM_MODEL_OPTION` (§5.3) instead.
 See [`m3-discovery.md`](m3-discovery.md).
 
+> **Discovery needs a gateway credential — a claude.ai OAuth *login* alone won't trigger it.**
+> Claude Code only issues the `/v1/models` request when `ANTHROPIC_AUTH_TOKEN` (or an API key)
+> is set; under a plain Max/Pro subscription login it sends nothing (no request reaches shunt,
+> no cache is written) even with the flag on. Verified: shunt served `/v1/models` correctly, but
+> the request never left Claude Code until a token was set.
+>
+> Use a **Claude Code OAuth token** (`claude setup-token`, `sk-ant-oat…`) as
+> `ANTHROPIC_AUTH_TOKEN` — one value covers both roles:
+>
+> ```bash
+> export ANTHROPIC_AUTH_TOKEN=sk-ant-oat…   # from `claude setup-token`
+> export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+> ```
+>
+> | Credential | Discovery label | Claude passthrough models | Billing |
+> | :-- | :-- | :-- | :-- |
+> | OAuth **login** only (no token) | ❌ never fires | ✅ | subscription |
+> | `ANTHROPIC_AUTH_TOKEN=sk-ant-oat…` (setup-token) | ✅ | ✅ | subscription |
+> | `ANTHROPIC_AUTH_TOKEN=sk-dummy` | ✅ | ❌ 401 (dummy forwarded to Anthropic) | — |
+> | `ANTHROPIC_AUTH_TOKEN=<real API key>` | ✅ | ✅ | **API (not subscription)** |
+>
+> The `setup-token` OAuth token is the best of both: it satisfies the discovery gate *and*
+> authenticates Claude-passthrough models on your subscription. `gpt-*` models are unaffected
+> either way — shunt injects the ChatGPT/OpenAI credential for them regardless of this token.
+
 ### 5.5 Reasoning effort
 
 Claude Code's effort level (`/effort`, the `/model` slider, `--effort`, or
