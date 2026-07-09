@@ -8,7 +8,7 @@ The name is the mechanism: an electrical/railway *shunt* diverts a selected part
 
 **Phase 1 target:** OpenAI / Codex / ChatGPT — translate Anthropic Messages ⇄ the OpenAI Responses API, over an OpenAI API key or a reused ChatGPT (`codex login`) subscription.
 
-**Status:** private, early. May be open-sourced later. See [`docs/implementation-plan.md`](docs/implementation-plan.md) for the design and milestones.
+**Status:** private, early. May be open-sourced later. See [`docs/running.md`](docs/running.md) to build, configure, and connect Claude Code, and [`docs/implementation-plan.md`](docs/implementation-plan.md) for the design and milestones.
 
 ## Why
 

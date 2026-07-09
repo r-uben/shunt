@@ -1,25 +1,63 @@
+# shunt configuration — copy to ./shunt.toml and edit.
+# Every provider below has a built-in default, so you only need the keys you
+# want to change. See docs/running.md §3 for the full reference.
+# Env overrides: SHUNT_ prefix, __ for nesting (e.g. SHUNT_SERVER__BIND=0.0.0.0:3001).
+
 [server]
-bind = "127.0.0.1:3001"
-default_provider = "anthropic"
+bind = "127.0.0.1:3001"        # address shunt listens on (ANTHROPIC_BASE_URL points here)
+default_provider = "anthropic" # provider for any model with no route -> pass-through to Anthropic
 
 [providers.anthropic]
 base_url = "https://api.anthropic.com"
 
+# OpenAI API (real OpenAI, authenticated with an API key).
 [providers.openai]
-adapter = "responses"
+adapter = "responses"          # must be "responses"
 base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
+api_key_env = "OPENAI_API_KEY" # env var shunt reads the key from
+# effort = "high"              # optional default reasoning effort (low|medium|high|xhigh)
 
-# Claude Code discovery only honors ids beginning with claude or anthropic.
-# Use ANTHROPIC_CUSTOM_MODEL_OPTION for non-Claude ids such as gpt-5.2-codex.
-# [[models]]
-# id = "claude-opus-via-codex"
-# display_name = "Opus (via Codex)"
+# ChatGPT / Codex subscription (reuses ~/.codex/auth.json — run `codex login`).
+[providers.codex]
+adapter = "responses"          # must be "responses"
+base_url = "https://chatgpt.com/backend-api"
+# auth = "chatgpt_oauth"       # default; reads + auto-refreshes ~/.codex/auth.json
+# effort = "high"
 
+# --- Routing: a request's `model` id picks the provider ---
+# Precedence: exact [[routes]] match -> [[route_prefixes]] -> server.default_provider.
+
+# Example A — route to the OpenAI API. `upstream_model`/`effort` are optional overrides.
 [[routes]]
-model = "gpt-5.2-codex"
+model = "gpt-5.2"
 provider = "openai"
+# upstream_model = "gpt-5.2"
+# effort = "high"
 
+# Example B — route to your ChatGPT subscription via Codex.
+# The ChatGPT-account backend REJECTS gpt-*-codex slugs; it only accepts the
+# account's live-entitled slugs (a free account resolves to gpt-5.5).
+# See docs/m2-chatgpt-oauth.md §0.
+# [[routes]]
+# model = "gpt-5.5"
+# provider = "codex"
+
+# Catch-all: send every gpt-* id to a provider.
 [[route_prefixes]]
 prefix = "gpt-"
 provider = "openai"
+
+# Model discovery (GET /v1/models) for the /model picker.
+# Claude Code IGNORES ids that don't begin with claude/anthropic, so gpt-* ids
+# never appear here — select those with ANTHROPIC_CUSTOM_MODEL_OPTION instead.
+# To surface a mapped model via discovery, expose a Claude-named ALIAS whose
+# [[routes]] entry rewrites it to the real upstream slug. It then shows in /model
+# labeled "From gateway". Requires CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1.
+# [[models]]
+# id = "claude-gpt-5.5-via-codex"        # must begin with claude/anthropic
+# display_name = "GPT-5.5 (via Codex)"
+#
+# [[routes]]
+# model = "claude-gpt-5.5-via-codex"     # the alias Claude Code sends
+# provider = "codex"
+# upstream_model = "gpt-5.5"             # real slug forwarded upstream
