@@ -391,6 +391,35 @@ export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 This is global, so it also removes attribution from any Anthropic-passthrough traffic (used for
 cost tracking) — which is fine when you're routing to another provider.
 
+### 5.7 Context / usage display for mapped models
+
+Claude Code's statusline and prompt footer compute the **context indicator locally** from the
+assistant message's token `usage` (`input_tokens + cache_read + cache_creation`) divided by the
+model's context-window size — no server field controls it. Two consequences for models routed to
+a `responses` provider (codex/OpenAI):
+
+- **Token count (the numerator) is accurate.** shunt reads `input_tokens` (and cached tokens) from
+  the Responses `usage` and forwards them in the Anthropic `message_delta`, so the bar fills as the
+  conversation grows. (The OpenAI `input_tokens` total includes cached tokens; shunt peels the
+  cached part into `cache_read_input_tokens`, preserving the total.)
+- **The window (the denominator) is a fixed 200k for unmapped ids.** `getContextWindowForModel`
+  returns `200_000` for any model id it doesn't recognize, and its accurate per-model lookup
+  (`max_input_tokens` from the gateway's `/v1/models`) is **disabled unless the base URL is
+  `api.anthropic.com`** — so a gateway can't set it. A model with a larger real window (e.g.
+  `gpt-5.6-sol` at 372k) therefore shows a **conservative, over-reported** percentage. This only
+  makes Claude Code's auto-compact trigger a little early; it is otherwise harmless.
+
+The only client-side lever is the `[1m]` model-id suffix, which forces a **1M** window — useful for
+a genuinely 1M-context model, but misleading (under-reporting) for a smaller one, so avoid it
+unless the upstream really has that window. Claude passthrough models are unaffected: Claude Code
+already knows their window sizes, so their percentage is exact.
+
+| Field | Mapped (`responses`) model | Claude passthrough |
+| :-- | :-- | :-- |
+| Context tokens used | ✅ accurate (forwarded by shunt) | ✅ accurate |
+| Context window (denominator) | ⚠️ 200k default (or `[1m]` → 1M) | ✅ exact |
+| `rate_limits` (5h / weekly) | ❌ needs Anthropic `anthropic-ratelimit-*` headers | ✅ shown |
+
 ---
 
 ## 6. Verify
