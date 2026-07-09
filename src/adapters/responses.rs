@@ -43,6 +43,12 @@ async fn forward(
         .unwrap_or(false);
     let upstream_body =
         translate_request(&body, &route).map_err(|error| own_error(error.to_string()))?;
+    tracing::debug!(
+        provider = %route.provider,
+        upstream_model = %route.upstream_model,
+        upstream_request = %upstream_body,
+        "responses upstream request"
+    );
     let credential = resolve_credential(&state.config, &route, &state.http_client).await?;
     let upstream = request_builder(&state, &route, credential)
         .body(upstream_body.to_string())
@@ -126,6 +132,7 @@ async fn mapped_upstream_error(
     provider: &str,
 ) -> AdapterError {
     let text = upstream.text().await.unwrap_or_default();
+    tracing::warn!(%status, %provider, upstream_error_body = %text, "responses upstream error");
     let value = if status == StatusCode::UNAUTHORIZED && matches!(provider, "codex" | "chatgpt") {
         json!({"message": "ChatGPT authentication failed; run codex login"})
     } else {

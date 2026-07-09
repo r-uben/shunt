@@ -17,17 +17,17 @@ pub struct ModelEntry {
 
 pub async fn get(State(state): State<AppState>, headers: HeaderMap) -> Json<ModelsResponse> {
     let _credential = discovery_credential(&headers);
-    Json(ModelsResponse {
-        data: state
-            .config
-            .models
-            .iter()
-            .map(|model| ModelEntry {
-                id: model.id.clone(),
-                display_name: model.display_name.clone(),
-            })
-            .collect(),
-    })
+    let data: Vec<ModelEntry> = state
+        .config
+        .models
+        .iter()
+        .map(|model| ModelEntry {
+            id: model.id.clone(),
+            display_name: model.display_name.clone(),
+        })
+        .collect();
+    tracing::info!(models = data.len(), "served GET /v1/models discovery");
+    Json(ModelsResponse { data })
 }
 
 fn discovery_credential(headers: &HeaderMap) -> Option<&str> {
