@@ -10,6 +10,12 @@ adapter = "responses"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 
+# Claude Code discovery only honors ids beginning with claude or anthropic.
+# Use ANTHROPIC_CUSTOM_MODEL_OPTION for non-Claude ids such as gpt-5.2-codex.
+# [[models]]
+# id = "claude-opus-via-codex"
+# display_name = "Opus (via Codex)"
+
 [[routes]]
 model = "gpt-5.2-codex"
 provider = "openai"

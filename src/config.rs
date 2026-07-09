@@ -12,6 +12,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub providers: ProvidersConfig,
     #[serde(default)]
+    pub models: Vec<ModelConfig>,
+    #[serde(default)]
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
     pub route_prefixes: Vec<RoutePrefixConfig>,
@@ -65,6 +67,12 @@ pub struct RouteConfig {
     pub provider: String,
     pub upstream_model: Option<String>,
     pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelConfig {
+    pub id: String,
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,6 +136,7 @@ impl Default for Config {
                     effort: None,
                 },
             },
+            models: Vec::new(),
             routes: Vec::new(),
             route_prefixes: Vec::new(),
         }
@@ -183,6 +192,14 @@ impl Config {
                 });
             }
         }
+        for model in &self.models {
+            if !self.routes.iter().any(|route| route.model == model.id) {
+                tracing::warn!(
+                    model_id = %model.id,
+                    "configured discovery model has no matching route"
+                );
+            }
+        }
         Ok(self)
     }
 
@@ -228,5 +245,58 @@ impl Config {
 impl ServerConfig {
     pub fn bind_addr(&self) -> Result<SocketAddr, ConfigError> {
         Ok(self.bind.parse()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use super::{Config, ModelConfig};
+
+    struct BufferWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for BufferWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn validate_warns_when_discovery_model_has_no_matching_route() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || BufferWriter {
+                buffer: Arc::clone(&writer_output),
+            })
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let config = Config {
+            models: vec![ModelConfig {
+                id: "claude-opus-via-codex".to_string(),
+                display_name: None,
+            }],
+            ..Config::default()
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            config.validate().unwrap();
+        });
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+
+        assert!(logs.contains("configured discovery model has no matching route"));
+        assert!(logs.contains("claude-opus-via-codex"));
     }
 }

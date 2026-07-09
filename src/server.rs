@@ -1,9 +1,9 @@
 use axum::{
-    routing::{head, post},
+    routing::{get, head, post},
     Router,
 };
 
-use crate::{config::Config, proxy};
+use crate::{config::Config, discovery, proxy};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,6 +19,7 @@ pub fn build_router(config: Config) -> Router {
 
     Router::new()
         .route("/", head(root_probe))
+        .route("/v1/models", get(discovery::get))
         .route("/v1/messages", post(proxy::post))
         .route("/v1/messages/count_tokens", post(proxy::post))
         .with_state(state)

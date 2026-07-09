@@ -66,6 +66,7 @@ async fn start_gateway(upstream_base_url: String) -> TestGateway {
                 effort: None,
             },
         },
+        models: Vec::new(),
         routes: Vec::new(),
         route_prefixes: Vec::new(),
     };

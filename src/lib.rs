@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod auth;
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod headers;
 pub mod model;
