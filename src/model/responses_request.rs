@@ -3,7 +3,11 @@ use serde_json::{json, Map, Value};
 
 use crate::routing::Route;
 
-pub fn translate_request(body: &[u8], route: &Route) -> Result<Value, serde_json::Error> {
+pub fn translate_request(
+    body: &[u8],
+    route: &Route,
+    chatgpt_backend: bool,
+) -> Result<Value, serde_json::Error> {
     let request: Value = serde_json::from_slice(body)?;
     let mut out = Map::new();
     out.insert("model".to_string(), json!(route.upstream_model));
@@ -40,9 +44,13 @@ pub fn translate_request(body: &[u8], route: &Route) -> Result<Value, serde_json
     }
     // Anthropic `max_tokens` caps output; the Responses equivalent is
     // `max_output_tokens`. Forward it so the client's cap is respected instead of
-    // falling back to the model default.
-    if let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) {
-        out.insert("max_output_tokens".to_string(), json!(max_tokens));
+    // falling back to the model default. The ChatGPT/Codex backend rejects the
+    // parameter it never receives from codex ("Unsupported parameter:
+    // max_output_tokens"), so send it only to the stock OpenAI Responses API.
+    if !chatgpt_backend {
+        if let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) {
+            out.insert("max_output_tokens".to_string(), json!(max_tokens));
+        }
     }
     out.insert("store".to_string(), json!(false));
     out.insert("stream".to_string(), json!(true));

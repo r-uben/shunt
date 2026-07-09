@@ -268,6 +268,16 @@ impl Config {
         self.providers.get(name)
     }
 
+    /// Whether `provider` is the ChatGPT/Codex backend (ChatGPT OAuth auth).
+    /// That backend serves the Responses API under `/codex/responses` and is
+    /// stricter than the stock OpenAI Responses API — it rejects parameters
+    /// codex never sends (e.g. `max_output_tokens`), so translation drops them.
+    pub fn is_chatgpt_backend(&self, provider: &str) -> bool {
+        self.provider(provider)
+            .map(|provider| provider.auth == AuthMode::ChatgptOauth)
+            .unwrap_or(false)
+    }
+
     pub fn provider_base_url(
         &self,
         provider: &str,

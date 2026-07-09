@@ -20,7 +20,8 @@ fn route(model: &str) -> Route {
 
 fn translate(input: Value) -> Value {
     let body = serde_json::to_vec(&input).unwrap();
-    translate_request(&body, &route("gpt-5.2-codex")).unwrap()
+    // provider "openai" is the stock Responses API (not the ChatGPT backend).
+    translate_request(&body, &route("gpt-5.2-codex"), false).unwrap()
 }
 
 #[test]
@@ -48,6 +49,25 @@ fn translates_plain_text_request() {
             "store": false,
             "stream": true
         })
+    );
+}
+
+#[test]
+fn omits_max_output_tokens_for_chatgpt_backend() {
+    // The ChatGPT/Codex backend rejects `max_output_tokens` ("Unsupported
+    // parameter"), so translation must drop it when chatgpt_backend is true.
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-5.2-codex",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 1000
+    }))
+    .unwrap();
+
+    let actual = translate_request(&body, &route("gpt-5.2-codex"), true).unwrap();
+
+    assert!(
+        actual.get("max_output_tokens").is_none(),
+        "max_output_tokens must not be sent to the ChatGPT backend: {actual}"
     );
 }
 
@@ -175,7 +195,7 @@ fn maps_thinking_and_route_override_to_effort() {
     let mut route = route("gpt-5.2-codex-low");
     route.effort = Some("xhigh".to_string());
     let body = serde_json::to_vec(&json!({"model": "gpt-5.2-codex-low", "messages": []})).unwrap();
-    let override_effort = translate_request(&body, &route).unwrap();
+    let override_effort = translate_request(&body, &route, false).unwrap();
     assert_eq!(override_effort["reasoning"]["effort"], "xhigh");
 }
 

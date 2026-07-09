@@ -49,8 +49,9 @@ async fn forward(
         .as_ref()
         .and_then(|value| value.pointer("/thinking/type").and_then(Value::as_str))
         == Some("enabled");
-    let upstream_body =
-        translate_request(&body, &route).map_err(|error| own_error(error.to_string()))?;
+    let chatgpt_backend = state.config.is_chatgpt_backend(&route.provider);
+    let upstream_body = translate_request(&body, &route, chatgpt_backend)
+        .map_err(|error| own_error(error.to_string()))?;
     tracing::debug!(
         provider = %route.provider,
         upstream_model = %route.upstream_model,
@@ -214,17 +215,14 @@ fn request_builder(
 }
 
 pub fn responses_url(config: &crate::config::Config, provider: &str) -> String {
-    let provider = config.provider(provider);
-    let base = provider
+    let base = config
+        .provider(provider)
         .map(|provider| provider.base_url.as_str())
         .unwrap_or("https://api.openai.com/v1")
         .trim_end_matches('/');
     // The ChatGPT/Codex backend serves the Responses API under /codex/responses;
     // a plain OpenAI-compatible upstream uses /responses.
-    let chatgpt = provider
-        .map(|provider| provider.auth == crate::config::AuthMode::ChatgptOauth)
-        .unwrap_or(false);
-    if chatgpt {
+    if config.is_chatgpt_backend(provider) {
         format!("{base}/codex/responses")
     } else {
         format!("{base}/responses")
