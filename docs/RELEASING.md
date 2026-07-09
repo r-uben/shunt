@@ -44,14 +44,22 @@ Everything below is prepared but **not yet executed** — the repo is still priv
    `rust-lang/crates-io-auth-action` (`id-token: write`) — no long-lived token secret.
    Note: on the *first* tag push the job will fail (the crate was just published
    manually with the same version); that's expected and harmless.
-3. **Tag and push:**
-   ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
-   The release workflow builds the four binaries, creates the GitHub release with
-   `SHA256SUMS`, and publishes `shunt-gateway` to crates.io.
-4. **Publish the formula.** Copy `packaging/homebrew/shunt.rb` into `pleaseai/homebrew-tap`
+3. **Set up the release-please GitHub App credentials.** Releases are cut by
+   release-please (`.github/workflows/release-please.yml`): it opens a release PR from
+   conventional commits, and merging that PR creates the `v<version>` tag + GitHub
+   release. It authenticates with a GitHub App token (the default `GITHUB_TOKEN` would
+   not trigger `release.yml` on the tag it pushes):
+   - Create a GitHub App (org → Settings → Developer settings → GitHub Apps) with
+     repository permissions **Contents: read & write** and **Pull requests: read &
+     write**, and install it on `pleaseai/shunt`.
+   - Set the `RELEASE_GITHUB_APP_CLIENT_ID` repository **variable** and the
+     `RELEASE_GITHUB_APP_PRIVATE_KEY` repository **secret** (the app's PEM key).
+4. **Merge the release PR.** release-please proposes `v0.1.0` (manifest starts at
+   `0.0.0`; the `feat:` history bumps it to `0.1.0`, matching `Cargo.toml`). Merging
+   tags `v0.1.0` and creates the GitHub release; the tag then triggers `release.yml`,
+   which builds the four binaries and uploads them + `SHA256SUMS` to that release, and
+   publishes `shunt-gateway` to crates.io via Trusted Publishing.
+5. **Publish the formula.** Copy `packaging/homebrew/shunt.rb` into `pleaseai/homebrew-tap`
    as `shunt.rb`, fill in the four `sha256` values from the release's `SHA256SUMS` asset,
    and open a PR against the tap. Then:
    ```bash
@@ -60,8 +68,12 @@ Everything below is prepared but **not yet executed** — the repo is still priv
 
 ## Subsequent releases
 
-Bump `version` in `Cargo.toml`, commit, tag `v<version>`, push the tag, then update
-`version` + the four `sha256` values in the tap's `shunt.rb`.
+Land conventional commits on `main`; release-please keeps a release PR up to date
+(`feat:` → minor, `fix:` → patch, `feat!:`/`BREAKING CHANGE:` → major). Merge the PR
+when ready — it bumps `Cargo.toml`/`Cargo.lock`, updates `CHANGELOG.md`, tags, and the
+rest of the pipeline (binaries, crates.io) runs automatically. Then update `version` +
+the four `sha256` values in the tap's `shunt.rb`. To force a specific version, add a
+`Release-As: x.y.z` footer to a commit.
 
 ## Notes
 

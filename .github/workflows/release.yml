@@ -63,7 +63,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: create GitHub release
+    name: upload release assets
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -78,13 +78,18 @@ jobs:
       - name: Checksums
         run: cd assets && shasum -a 256 shunt-* > SHA256SUMS
 
-      - name: Create release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
-        with:
-          files: |
-            assets/shunt-*
-            assets/SHA256SUMS
-          generate_release_notes: true
+      # The GitHub release itself is created by release-please when its
+      # release PR merges; this attaches the binaries to it. A manually
+      # pushed tag (no release-please release) still works via the fallback.
+      - name: Upload assets
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --generate-notes
+          gh release upload "$TAG" assets/shunt-* assets/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
 
   # Uses crates.io Trusted Publishing (OIDC) — no long-lived token secret.
   # The very first release of the crate must be published manually with an API

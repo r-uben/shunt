@@ -1,0 +1,31 @@
+name: release-please
+
+# Opens/updates a release PR from conventional commits; merging that PR tags
+# v<version> and creates the GitHub release. Runs with a GitHub App token so
+# the tag push triggers release.yml (the default GITHUB_TOKEN would not) and
+# CI runs on the release PR.
+#
+# Setup: create a GitHub App with contents:write + pull-requests:write,
+# install it on this repository, then set the RELEASE_GITHUB_APP_CLIENT_ID
+# variable and the RELEASE_GITHUB_APP_PRIVATE_KEY secret.
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
+
+      - name: Run release-please
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
