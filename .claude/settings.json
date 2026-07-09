@@ -1,8 +1,13 @@
 {
+  "env": {
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT": "1"
+  },
   "enabledPlugins": {
     "codex-delegation@passionfactory": true,
     "codex@passionfactory": true,
-    "claude-code-docs@passionfactory": true
+    "claude-code-docs@passionfactory": true,
+    "astro@pleaseai": true
   },
   "language": "english"
 }
