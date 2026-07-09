@@ -4,7 +4,7 @@
 
 `shunt` is a spec-compliant [Claude Code LLM gateway](https://code.claude.com/docs/en/llm-gateway-protocol): a transparent proxy that, for the **models you map**, diverts inference to another LLM provider at the **inference layer**. It routes by the request's `model` id — everything else passes through to Anthropic unchanged (the "shunt").
 
-The name is the mechanism: an electrical/railway *shunt* diverts a selected part of the flow onto a parallel path. Here, a mapped model's inference is diverted to another provider while Claude Code's tools, skills, and `${CLAUDE_SKILL_DIR}` resolution stay intact.
+The name is the mechanism: an electrical/railway *shunt* diverts a selected part of the flow onto a parallel path. Here, a mapped model's inference is diverted to another provider while Claude Code's tools and skills stay intact.
 
 **Phase 1 target:** OpenAI / Codex / ChatGPT — translate Anthropic Messages ⇄ the OpenAI Responses API, over an OpenAI API key or a reused ChatGPT (`codex login`) subscription.
 
@@ -14,7 +14,7 @@ The name is the mechanism: an electrical/railway *shunt* diverts a selected part
 
 Claude Code sends every turn to the Anthropic API. `shunt` sits in front (via `ANTHROPIC_BASE_URL`) and, for the models you map, diverts their inference to another provider (OpenAI, Codex/ChatGPT, …). Because routing happens at the HTTP/inference layer — not by handing the task off to a different CLI — the session keeps running inside Claude Code's harness: same tool loop, same preloaded skills, same bundled-script path resolution. Only token generation is outsourced.
 
-Contrast with the alternative approach (handing a `subagent_type` off to another runtime like Codex CLI), which cuts higher in the stack and drops persona, preloaded skills, and breaks `${CLAUDE_SKILL_DIR}` script references.
+Contrast with the alternative approach (handing a `subagent_type` off to another runtime like Codex CLI), which cuts higher in the stack and drops persona and preloaded skills.
 
 ### Per-model, not per-agent — and not a global swap
 
