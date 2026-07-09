@@ -7,6 +7,27 @@
 > resolves the `openai` API-key path). Reference: `insightflo/chatgpt-codex-proxy/src/auth.ts`
 > and the real `~/.codex/auth.json` written by `codex login`.
 
+## 0. Model slugs — verified against the live backend (2026-07-09)
+
+The ChatGPT-account Codex backend (`/backend-api/codex/responses`) **rejects the
+`gpt-*-codex` slugs** the insightflo reference hardcodes (e.g. `gpt-5.2-codex`,
+`gpt-5.1-codex`) with `400 {"detail":"The 'X' model is not supported when using Codex with a
+ChatGPT account."}`. It only accepts the **account's live-entitled slugs**, which the codex CLI
+fetches from its `/models` endpoint and which vary by plan. Verified end-to-end: a **free**
+ChatGPT account resolves to **`gpt-5.5`** (the codex CLI itself used `gpt-5.5`; `gpt-5.6-sol`
+and `gpt-5.2` were rejected for that account).
+
+Implications:
+- **Do NOT hardcode a `-codex` model map.** shunt passes the request `model` through (or a
+  route's `upstream_model`), so the developer picks a currently-entitled slug via
+  `ANTHROPIC_CUSTOM_MODEL_OPTION` (e.g. `gpt-5.5`). The stale table in
+  [`m3-discovery.md`](m3-discovery.md) §5 / `insightflo`'s `models.ts` is reference-only.
+- To discover the exact usable slugs for an account, look at what `codex` itself sends, or its
+  bundled catalog `codex-rs/models-manager/models.json` filtered by the account's
+  `chatgpt_plan_type` — but the authoritative source is the live `/models` fetch.
+- shunt surfaces the backend's `detail` message on error (fixed 2026-07-09), so a wrong slug
+  now returns the real reason rather than a generic "upstream request failed".
+
 ## 1. Scope
 
 - Acquire a valid **ChatGPT OAuth access token + account id** for the `codex`/`chatgpt`

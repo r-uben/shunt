@@ -59,6 +59,13 @@ is the documented default. Discovery is only useful if shunt exposes a **Claude-
 
 ## 5. Model map + effort (`codex/models.rs`)
 
+> **Stale-slug warning (verified 2026-07-09):** the `gpt-*-codex` names below (from
+> `insightflo`) are **rejected** by the live ChatGPT Codex backend. Real usable slugs are
+> account/plan-entitled (e.g. a free account → `gpt-5.5`) and fetched live by the codex CLI.
+> Treat this table as reference only; prefer passing the model through / `upstream_model`.
+> See [`m2-chatgpt-oauth.md`](m2-chatgpt-oauth.md) §0.
+
+
 Referenced by M1 §5/§7. Provide:
 - `map_model(id, route) -> upstream_model`: prefer the route's `upstream_model`; else a table
   fallback (`gpt-5.2 → gpt-5.2-codex`, etc.); else the id unchanged.
