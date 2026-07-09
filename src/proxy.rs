@@ -10,6 +10,8 @@ use tracing::Instrument;
 
 use crate::{
     adapters::{anthropic::AnthropicAdapter, responses::ResponsesAdapter, Adapter, AdapterError},
+    config::CountTokens,
+    count_tokens,
     error::{ShuntError, UpstreamError},
     routing::{self, AdapterKind},
     server::AppState,
@@ -110,14 +112,28 @@ async fn forward(
         message: "failed to route request".to_string(),
         response: error.into_response(),
     })?;
-    // The Responses API has no token-counting endpoint, and synthesizing counts
-    // would be inaccurate, so return 404 for count_tokens on a responses-routed
-    // model: Claude Code treats an absent count_tokens endpoint as a signal to
-    // estimate tokens locally (gateway protocol). Without this the request would
-    // be translated into — and billed as — a full inference call. Anthropic-routed
-    // models still pass through to the upstream count_tokens endpoint below.
+    // The Responses API has no token-counting endpoint. For a responses-routed
+    // model, either count locally with tiktoken (opt-in) or return 404 so Claude
+    // Code estimates tokens locally (gateway protocol). Either way we must NOT let
+    // the request reach the responses adapter, which would translate it into — and
+    // bill it as — a full inference call. Anthropic-routed models still pass
+    // through to the upstream count_tokens endpoint below.
     if is_count_tokens(uri) && route.adapter == AdapterKind::Responses {
-        return Ok((StatusCode::NOT_FOUND, count_tokens_unsupported()));
+        let mode = state
+            .config
+            .provider(&route.provider)
+            .map(|provider| provider.count_tokens)
+            .unwrap_or(CountTokens::Estimate);
+        return Ok(match mode {
+            CountTokens::Tiktoken => {
+                let input_tokens = count_tokens::count_input_tokens(&body);
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({ "input_tokens": input_tokens })).into_response(),
+                )
+            }
+            CountTokens::Estimate => (StatusCode::NOT_FOUND, count_tokens_unsupported()),
+        });
     }
     let body = body.to_vec();
     let result = match route.adapter {

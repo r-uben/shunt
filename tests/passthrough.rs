@@ -2,7 +2,7 @@ use std::{io::ErrorKind, net::SocketAddr, time::Duration};
 
 use reqwest::StatusCode;
 use shunt::{
-    config::{Config, RoutePrefixConfig},
+    config::{Config, CountTokens, RoutePrefixConfig},
     server,
 };
 use tokio::task::JoinHandle;
@@ -286,5 +286,41 @@ async fn count_tokens_returns_404_for_responses_model() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(response.text().await.unwrap().contains("count_tokens"));
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn count_tokens_uses_tiktoken_when_enabled() {
+    if !can_bind_loopback() {
+        return;
+    }
+    // With count_tokens = tiktoken, shunt answers locally (200 + input_tokens)
+    // without ever calling an upstream.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+
+    let mut config = Config::default();
+    config.providers.get_mut("anthropic").unwrap().base_url = upstream.uri();
+    config.providers.get_mut("codex").unwrap().count_tokens = CountTokens::Tiktoken;
+    config.route_prefixes = vec![RoutePrefixConfig {
+        prefix: "gpt-".to_string(),
+        provider: "codex".to_string(),
+    }];
+    let gateway = start_gateway_with(config).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/messages/count_tokens", gateway.base_url))
+        .body(r#"{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"Write a haiku about the sea."}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert!(body["input_tokens"].as_u64().unwrap() > 0);
     upstream.verify().await;
 }

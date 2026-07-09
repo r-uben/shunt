@@ -118,6 +118,7 @@ a brand-new table adds a provider. Every provider takes these keys:
 | `api_key_env` | env var name | Where the key is read from, when `auth = "api_key"`. |
 | `api_key_header` | `bearer` (default) \| `x_api_key` | Header the injected key is sent in. |
 | `effort` | `low`…`max` | Optional default reasoning effort (`responses` providers). |
+| `count_tokens` | `estimate` (default) \| `tiktoken` | For `responses` providers: `estimate` returns 404 so Claude Code estimates locally; `tiktoken` computes an approximate local count (o200k_base) and returns `{"input_tokens": N}`. See §4. |
 
 Most third-party "use Claude Code with X" gateways are **Anthropic-Messages-compatible**: they are
 `kind = "anthropic"` with `auth = "api_key"`, differing only in `base_url` and the key env var.
@@ -187,10 +188,25 @@ e.g. `RUST_LOG=shunt=debug cargo run -- run`.
 
 **`count_tokens`:** for an **Anthropic-routed** model shunt passes the request through to the
 upstream's `count_tokens` endpoint (exact counts). For a **`responses`-routed** model (codex/OpenAI)
-there is no equivalent endpoint, and synthesizing a count would be inaccurate, so shunt returns
-**404** — Claude Code then estimates tokens locally, which the [gateway
-protocol](https://code.claude.com/docs/en/llm-gateway-protocol) explicitly allows for an absent
-`count_tokens` endpoint. (This also avoids turning a count request into a billed inference call.)
+there is no equivalent upstream endpoint, so the provider's `count_tokens` setting decides:
+
+- `count_tokens = "estimate"` (default) — shunt returns **404**; Claude Code then estimates tokens
+  locally, which the [gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol)
+  explicitly allows for an absent endpoint.
+- `count_tokens = "tiktoken"` (opt-in) — shunt computes an **approximate** count locally with
+  tiktoken's `o200k_base` encoder and returns `{"input_tokens": N}`. This is closer than Claude
+  Code's `char/4` fallback, but **not exact**: the backend's billed count also includes reasoning
+  tokens, image/tool-schema encoding, and cache accounting that a text-only local count can't see.
+  It also can't perfectly match a model whose real encoder differs from `o200k_base`.
+
+Either way the request never reaches the responses adapter, so a count request is never turned into
+(and billed as) a full inference call. Enable tiktoken per provider:
+
+```toml
+[providers.codex]
+kind = "responses"
+count_tokens = "tiktoken"
+```
 
 ---
 
@@ -425,6 +441,7 @@ already knows their window sizes, so their percentage is exact.
 | :-- | :-- | :-- |
 | Context tokens used | ✅ accurate (forwarded by shunt) | ✅ accurate |
 | Context window (denominator) | ⚠️ 200k default (or `[1m]` → 1M) | ✅ exact |
+| `count_tokens` (pre-flight) | ⚠️ client `char/4`, or `count_tokens = "tiktoken"` for a closer local count (§4) | ✅ exact (upstream) |
 | `rate_limits` (5h / weekly) | ❌ needs Anthropic `anthropic-ratelimit-*` headers | ✅ shown |
 
 ---
