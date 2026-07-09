@@ -1,7 +1,8 @@
 # Releasing shunt
 
 Everything below is prepared but **not yet executed** — the repo is still private
-(`chatbot-pf/shunt`) and nothing has been published. This is the go-live sequence.
+(`chatbot-pf/shunt`) and nothing has been published. The plan: transfer to
+`pleaseai/shunt`, make it public, then release. This is the go-live sequence.
 
 ## What is already in place
 
@@ -27,10 +28,22 @@ Everything below is prepared but **not yet executed** — the repo is still priv
    permissions. If the repo ends up anywhere other than `pleaseai/shunt`, update
    `repository` in `Cargo.toml` and the URLs in `packaging/homebrew/shunt.rb`.
    Also update `README.md`'s "private, early" status line.
-2. **Add the crates.io token** as the `CARGO_REGISTRY_TOKEN` repo secret
-   (crates.io → Account Settings → API Tokens, scope `publish-new` + `publish-update`).
-   The first publish must be done by an account that will own the crate; add other owners
-   with `cargo owner --add`.
+2. **Publish `shunt-gateway` v0.1.0 to crates.io manually** — Trusted Publishing can only
+   be configured for a crate that already exists, so the first publish uses a personal
+   API token (crates.io → Account Settings → API Tokens, scope `publish-new`):
+   ```bash
+   cargo publish --locked --token <token>
+   ```
+   The publishing account owns the crate; add other owners with `cargo owner --add`.
+   Then set up OIDC for future releases:
+   - crates.io → `shunt-gateway` → Settings → **Trusted Publishing** → add GitHub:
+     repository `pleaseai/shunt`, workflow `release.yml`, environment `release`.
+   - GitHub → repo Settings → Environments → create an environment named `release`
+     (optionally with required reviewers / tag-only deployment branches).
+   The `publish-crate` job in `release.yml` authenticates via
+   `rust-lang/crates-io-auth-action` (`id-token: write`) — no long-lived token secret.
+   Note: on the *first* tag push the job will fail (the crate was just published
+   manually with the same version); that's expected and harmless.
 3. **Tag and push:**
    ```bash
    git tag v0.1.0
@@ -57,5 +70,6 @@ Bump `version` in `Cargo.toml`, commit, tag `v<version>`, push the tag, then upd
   `release.yml` to `-gnu` and accept the newer-glibc floor.
 - `cargo install shunt-gateway` is the crates.io install path; homebrew is the
   binary path. Both produce a `shunt` binary.
-- The `publish-crate` job runs after the GitHub release; if it fails (e.g. missing token),
-  the release itself is unaffected — fix and `cargo publish` manually from the tag.
+- The `publish-crate` job runs after the GitHub release; if it fails (e.g. Trusted
+  Publishing not yet configured, or the version already exists on crates.io), the
+  release itself is unaffected — fix and `cargo publish` manually from the tag.
