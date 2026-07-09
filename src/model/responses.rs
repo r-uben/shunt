@@ -30,6 +30,8 @@ pub struct AnthropicSseMachine {
     index: usize,
     open: Option<OpenBlock>,
     saw_tool: bool,
+    input_tokens: u64,
+    cache_read_tokens: u64,
     output_tokens: u64,
     content: Vec<Value>,
     text_buffer: String,
@@ -53,6 +55,8 @@ impl AnthropicSseMachine {
             index: 0,
             open: None,
             saw_tool: false,
+            input_tokens: 0,
+            cache_read_tokens: 0,
             output_tokens: 0,
             content: Vec::new(),
             text_buffer: String::new(),
@@ -109,7 +113,7 @@ impl AnthropicSseMachine {
             "content": self.content,
             "stop_reason": if self.saw_tool { "tool_use" } else { "end_turn" },
             "stop_sequence": null,
-            "usage": {"input_tokens": 0, "output_tokens": self.output_tokens},
+            "usage": self.usage_value(),
         })
     }
 
@@ -291,22 +295,51 @@ impl AnthropicSseMachine {
                 &json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                    "usage": {"output_tokens": self.output_tokens}
+                    // Carry input_tokens here (not message_start): the Responses
+                    // API only reports usage at response.completed, so this is the
+                    // first point shunt knows the prompt size. The Anthropic SDK
+                    // merges message_delta usage into the message, which is what
+                    // Claude Code reads for its context-window indicator.
+                    "usage": self.usage_value()
                 }),
             ),
             sse("message_stop", &json!({"type": "message_stop"})),
         ]
     }
 
+    /// Anthropic-shaped usage. Claude Code's context indicator sums
+    /// input_tokens + cache_read + cache_creation, so the split must preserve the
+    /// total. OpenAI's `input_tokens` already includes cached tokens, so
+    /// cache_read is peeled off and input_tokens holds the uncached remainder.
+    fn usage_value(&self) -> Value {
+        json!({
+            "input_tokens": self.input_tokens,
+            "cache_read_input_tokens": self.cache_read_tokens,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": self.output_tokens,
+        })
+    }
+
     fn read_usage(&mut self, data: &Value) {
-        let usage = data
+        let Some(usage) = data
             .pointer("/response/usage")
-            .or_else(|| data.get("usage"));
-        if let Some(tokens) = usage
-            .and_then(|usage| usage.get("output_tokens"))
-            .and_then(Value::as_u64)
-        {
+            .or_else(|| data.get("usage"))
+        else {
+            return;
+        };
+        if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
             self.output_tokens = tokens;
+        }
+        // OpenAI `input_tokens` counts total prompt tokens including cached ones;
+        // peel the cached portion into cache_read so the sum still equals the
+        // prompt size Claude Code charts against the context window.
+        let cached = usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if let Some(total_input) = usage.get("input_tokens").and_then(Value::as_u64) {
+            self.cache_read_tokens = cached.min(total_input);
+            self.input_tokens = total_input - self.cache_read_tokens;
         }
     }
 

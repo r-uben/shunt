@@ -200,7 +200,7 @@ fn streaming_state_machine_emits_incremental_anthropic_events() {
         "event: response.function_call_arguments.done\n",
         "data: {\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}\n\n",
         "event: response.completed\n",
-        "data: {\"response\":{\"usage\":{\"output_tokens\":9}}}\n\n",
+        "data: {\"response\":{\"usage\":{\"input_tokens\":1200,\"input_tokens_details\":{\"cached_tokens\":800},\"output_tokens\":9}}}\n\n",
         "data: [DONE]\n\n"
     );
     let mut machine = AnthropicSseMachine::new("gpt-5.2-codex");
@@ -230,6 +230,13 @@ fn streaming_state_machine_emits_incremental_anthropic_events() {
     assert!(emitted.contains("\"text\":\"Hel\""));
     assert!(emitted.contains("\"partial_json\":\"{\\\"path\\\":\""));
     assert!(emitted.contains("\"stop_reason\":\"tool_use\""));
+    // Prompt-size usage must reach message_delta so Claude Code's context
+    // indicator works for non-Anthropic (Responses) models. OpenAI input_tokens
+    // (1200, incl. 800 cached) splits into input_tokens 400 + cache_read 800,
+    // preserving the 1200 total the context window is charted against.
+    assert!(emitted.contains("\"input_tokens\":400"));
+    assert!(emitted.contains("\"cache_read_input_tokens\":800"));
+    assert!(emitted.contains("\"output_tokens\":9"));
 }
 
 #[test]
