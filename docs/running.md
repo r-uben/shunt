@@ -232,6 +232,44 @@ cached/built-in list — run `claude --debug` and look for `[gatewayDiscovery]` 
 it ran. For `gpt-*` ids without an alias, use `ANTHROPIC_CUSTOM_MODEL_OPTION` (§5.3) instead.
 See [`m3-discovery.md`](m3-discovery.md).
 
+### 5.5 Reasoning effort
+
+Claude Code's effort level (`/effort`, the `/model` slider, `--effort`, or
+`CLAUDE_CODE_EFFORT_LEVEL`) is sent as the `output_config.effort` request field, and shunt maps
+it to the Responses `reasoning.effort` for mapped models:
+
+| Claude Code effort | → `reasoning.effort` |
+| :-- | :-- |
+| `low` / `medium` / `high` / `xhigh` | passthrough |
+| `max` | `xhigh` (the Responses API has no `max`) |
+
+**For a custom gateway id like `gpt-5.5` you must set `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1`** —
+otherwise Claude Code omits `output_config.effort` for model ids it doesn't recognize as
+effort-capable, and shunt falls back to `medium`.
+
+```bash
+export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1
+```
+
+Precedence in shunt: a config `route.effort` / `[providers.*].effort` override wins first;
+otherwise the request's `output_config.effort` is honored; otherwise `thinking.enabled → high`,
+then a model-name suffix (`-xhigh`/`-high`/`-medium`/`-low`), else `medium`.
+
+### 5.6 (Optional) Attribution block
+
+Claude Code prepends an attribution line to the system prompt
+(`x-anthropic-billing-header: cc_version=…; cc_entrypoint=cli;`). Anthropic strips it before
+processing, but shunt forwards it unchanged, so a mapped provider such as the ChatGPT Codex
+backend receives it as the first line of `instructions`. It's harmless (requests still succeed)
+but meaningless noise for a non-Anthropic model. To drop it:
+
+```bash
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+```
+
+This is global, so it also removes attribution from any Anthropic-passthrough traffic (used for
+cost tracking) — which is fine when you're routing to another provider.
+
 ---
 
 ## 6. Verify
@@ -297,5 +335,6 @@ codex login                    # Codex/ChatGPT provider
 # 5. Point Claude Code at it and select a mapped model
 export ANTHROPIC_BASE_URL=http://127.0.0.1:3001
 export ANTHROPIC_CUSTOM_MODEL_OPTION="gpt-5.5"
+export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1   # so /effort maps to reasoning.effort (§5.5)
 claude                         # then /model -> pick gpt-5.5
 ```
