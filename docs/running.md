@@ -118,7 +118,7 @@ a brand-new table adds a provider. Every provider takes these keys:
 | `api_key_env` | env var name | Where the key is read from, when `auth = "api_key"`. |
 | `api_key_header` | `bearer` (default) \| `x_api_key` | Header the injected key is sent in. |
 | `effort` | `low`…`max` | Optional default reasoning effort (`responses` providers). |
-| `count_tokens` | `estimate` (default) \| `tiktoken` | For `responses` providers: `estimate` returns 404 so Claude Code estimates locally; `tiktoken` computes an approximate local count (o200k_base) and returns `{"input_tokens": N}`. See §4. |
+| `count_tokens` | `tiktoken` (default) \| `estimate` | For `responses` providers: `tiktoken` computes a local count (o200k_base) and returns `{"input_tokens": N}`; `estimate` returns 404 so the client falls back on its own. See §4. |
 
 Most third-party "use Claude Code with X" gateways are **Anthropic-Messages-compatible**: they are
 `kind = "anthropic"` with `auth = "api_key"`, differing only in `base_url` and the key env var.
@@ -190,22 +190,26 @@ e.g. `RUST_LOG=shunt=debug cargo run -- run`.
 upstream's `count_tokens` endpoint (exact counts). For a **`responses`-routed** model (codex/OpenAI)
 there is no equivalent upstream endpoint, so the provider's `count_tokens` setting decides:
 
-- `count_tokens = "estimate"` (default) — shunt returns **404**; Claude Code then estimates tokens
-  locally, which the [gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol)
-  explicitly allows for an absent endpoint.
-- `count_tokens = "tiktoken"` (opt-in) — shunt computes an **approximate** count locally with
-  tiktoken's `o200k_base` encoder and returns `{"input_tokens": N}`. This is closer than Claude
-  Code's `char/4` fallback, but **not exact**: the backend's billed count also includes reasoning
-  tokens, image/tool-schema encoding, and cache accounting that a text-only local count can't see.
-  It also can't perfectly match a model whose real encoder differs from `o200k_base`.
+- `count_tokens = "tiktoken"` (default) — shunt computes the count locally with tiktoken's
+  `o200k_base` encoder and returns `{"input_tokens": N}`. o200k_base is the GPT-family encoder, so
+  for responses-routed models the text count is near-exact, though it can't see the backend's
+  image/tool-schema encoding or cache accounting. Each count is answered in-process (~ms), which
+  matters because Claude Code's `/context` issues one `count_tokens` call **per displayed item**
+  (system-prompt section, memory file, agent, deferred tool, …) — 30–50 calls per invocation.
+- `count_tokens = "estimate"` (opt-in) — shunt returns **404**, which the
+  [gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol) explicitly allows for an
+  absent endpoint. Note what Claude Code actually does then: the main-loop context bar estimates
+  locally, but `/context` re-runs **every** category count against Haiku over the network — slow,
+  and silently reported as 0 tokens when no Anthropic credential is available. Use it only if you
+  want shunt to carry no tokenizer.
 
 Either way the request never reaches the responses adapter, so a count request is never turned into
-(and billed as) a full inference call. Enable tiktoken per provider:
+(and billed as) a full inference call. Opt out per provider:
 
 ```toml
 [providers.codex]
 kind = "responses"
-count_tokens = "tiktoken"
+count_tokens = "estimate"
 ```
 
 ---

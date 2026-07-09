@@ -259,9 +259,10 @@ async fn count_tokens_returns_404_for_responses_model() {
     if !can_bind_loopback() {
         return;
     }
-    // The upstream must never be hit: a responses-model count_tokens is
-    // short-circuited to 404 (so Claude Code estimates locally) rather than
-    // translated into a billed inference call.
+    // The upstream must never be hit: with the opt-in estimate mode, a
+    // responses-model count_tokens is short-circuited to 404 (so the client
+    // falls back on its own) rather than translated into a billed inference
+    // call.
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500))
@@ -271,6 +272,7 @@ async fn count_tokens_returns_404_for_responses_model() {
 
     let mut config = Config::default();
     config.providers.get_mut("anthropic").unwrap().base_url = upstream.uri();
+    config.providers.get_mut("codex").unwrap().count_tokens = CountTokens::Estimate;
     config.route_prefixes = vec![RoutePrefixConfig {
         prefix: "gpt-".to_string(),
         provider: "codex".to_string(),
@@ -290,12 +292,12 @@ async fn count_tokens_returns_404_for_responses_model() {
 }
 
 #[tokio::test]
-async fn count_tokens_uses_tiktoken_when_enabled() {
+async fn count_tokens_uses_tiktoken_by_default() {
     if !can_bind_loopback() {
         return;
     }
-    // With count_tokens = tiktoken, shunt answers locally (200 + input_tokens)
-    // without ever calling an upstream.
+    // tiktoken is the default count_tokens mode: shunt answers locally
+    // (200 + input_tokens) without ever calling an upstream.
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500))
@@ -305,7 +307,11 @@ async fn count_tokens_uses_tiktoken_when_enabled() {
 
     let mut config = Config::default();
     config.providers.get_mut("anthropic").unwrap().base_url = upstream.uri();
-    config.providers.get_mut("codex").unwrap().count_tokens = CountTokens::Tiktoken;
+    assert_eq!(
+        config.provider("codex").unwrap().count_tokens,
+        CountTokens::Tiktoken,
+        "tiktoken must be the built-in default"
+    );
     config.route_prefixes = vec![RoutePrefixConfig {
         prefix: "gpt-".to_string(),
         provider: "codex".to_string(),

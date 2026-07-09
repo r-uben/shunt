@@ -58,13 +58,17 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CountTokens {
-    /// Return 404 so Claude Code estimates tokens locally (no server endpoint
-    /// exists on the Responses API; the gateway protocol allows this).
-    #[default]
+    /// Return 404 so the client falls back on its own (no server endpoint
+    /// exists on the Responses API; the gateway protocol allows this). Claude
+    /// Code's /context reacts by re-counting every category against Haiku over
+    /// the network — slow, and silently zero without an Anthropic credential —
+    /// so this is opt-in rather than the default.
     Estimate,
-    /// Compute an approximate count locally with tiktoken (o200k_base) and
-    /// return `{"input_tokens": N}` — closer than the client's char/4 estimate,
-    /// but not an exact match for the backend's billed count.
+    /// Compute the count locally with tiktoken (o200k_base) and return
+    /// `{"input_tokens": N}`. o200k_base is the GPT-family encoder, so for
+    /// responses-routed models this is near-exact for text, though it can't see
+    /// the backend's image/tool-schema encoding or cache accounting.
+    #[default]
     Tiktoken,
 }
 
@@ -154,7 +158,7 @@ impl ProviderConfig {
             api_key_env: None,
             api_key_header: ApiKeyHeader::Bearer,
             effort: None,
-            count_tokens: CountTokens::Estimate,
+            count_tokens: CountTokens::default(),
         }
     }
 }
@@ -175,7 +179,7 @@ impl Default for Config {
                     api_key_env: Some("OPENAI_API_KEY".to_string()),
                     api_key_header: ApiKeyHeader::Bearer,
                     effort: None,
-                    count_tokens: CountTokens::Estimate,
+                    count_tokens: CountTokens::default(),
                 },
             ),
             (
@@ -187,7 +191,7 @@ impl Default for Config {
                     api_key_env: None,
                     api_key_header: ApiKeyHeader::Bearer,
                     effort: None,
-                    count_tokens: CountTokens::Estimate,
+                    count_tokens: CountTokens::default(),
                 },
             ),
         ]);
