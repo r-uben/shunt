@@ -730,12 +730,52 @@ pub fn map_error_value(value: &Value, status: StatusCode) -> Value {
     })
 }
 
+// HTTP 529 ("upstream overloaded") has no named constant in the `http`
+// crate — it isn't in the IANA registry. Anthropic uses it to mean "the
+// upstream is at capacity"; Claude Code backs off and retries on it instead
+// of failing the turn, so it must reach the client as its own status rather
+// than folding into a generic `api_error`.
+
+/// Map an upstream HTTP status to the Anthropic error envelope's
+/// `error.type`, per the table in `docs/gateway-protocol.md#error-envelopes`.
+/// Shared by every translated backend (Responses/Codex, xAI, Cursor) so they
+/// surface the same vocabulary the Anthropic-direct path streams verbatim.
 pub fn anthropic_error_type(status: StatusCode) -> &'static str {
     match status {
-        StatusCode::UNAUTHORIZED => "authentication_error",
-        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
         StatusCode::BAD_REQUEST => "invalid_request_error",
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::NOT_IMPLEMENTED => "not_supported",
+        _ if status.as_u16() == 529 => "overloaded_error",
         _ => "api_error",
+    }
+}
+
+/// Client-facing HTTP status for a mapped upstream error. The standard error
+/// statuses reach the client unchanged so status-based client behavior (the
+/// `529` overload backoff, distinguishing `503`/`500` from a generic gateway
+/// failure) sees the real upstream signal; anything outside that set
+/// collapses to `502` rather than leaking an unexpected upstream status
+/// verbatim.
+pub fn client_facing_status(status: StatusCode) -> StatusCode {
+    const PRESERVED: &[StatusCode] = &[
+        StatusCode::BAD_REQUEST,
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::NOT_IMPLEMENTED,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::GATEWAY_TIMEOUT,
+    ];
+    if PRESERVED.contains(&status) || status.as_u16() == 529 {
+        status
+    } else {
+        StatusCode::BAD_GATEWAY
     }
 }
 
@@ -764,7 +804,7 @@ fn error_message(value: &Value) -> String {
 /// case-insensitively), and it parses "N tokens > M maximum" from it to
 /// size the retry. Upstream providers phrase the same failure in their own
 /// words, which would otherwise strand the session until a manual /compact.
-fn context_overflow_message(value: &Value, message: &str) -> Option<String> {
+pub fn context_overflow_message(value: &Value, message: &str) -> Option<String> {
     let code = value
         .pointer("/error/code")
         .or_else(|| value.pointer("/response/error/code"))
