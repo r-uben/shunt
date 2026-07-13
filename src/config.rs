@@ -351,9 +351,12 @@ pub enum ResponsesFlavor {
     /// ChatGPT/Codex backend under /codex/responses — rejects parameters codex
     /// never sends (e.g. `max_output_tokens`).
     Chatgpt,
-    /// xAI Grok Responses API — rejects `service_tier`/`text`, and 400s on
+    /// xAI developer Responses API — rejects `service_tier`/`text`, and 400s on
     /// `reasoning.effort` for several grok models, so reasoning stays opt-in.
     Xai,
+    /// Grok CLI subscription proxy. It otherwise speaks the xAI dialect, but
+    /// additionally accepts the hosted `web_search` tool.
+    Grok,
 }
 
 /// Whether `host` belongs to xAI (`x.ai` or any subdomain). Used both to gate
@@ -984,16 +987,17 @@ impl Config {
         if provider.auth == AuthMode::ChatgptOauth {
             return ResponsesFlavor::Chatgpt;
         }
-        // The subscription OAuth path (Grok CLI proxy on grok.com) speaks the
-        // same xAI dialect as api.x.ai but its host isn't an x.ai host, so key
-        // the flavor on the auth mode as well as the host.
-        if provider.auth == AuthMode::XaiOauth {
-            return ResponsesFlavor::Xai;
-        }
         let host = reqwest::Url::parse(&provider.base_url)
             .ok()
             .and_then(|url| url.host_str().map(ToOwned::to_owned))
             .unwrap_or_default();
+        // Hosted tools are a Grok CLI-proxy capability, not an OAuth capability:
+        // an xai_oauth provider may still target the developer API at api.x.ai.
+        if provider.auth == AuthMode::XaiOauth
+            && (host == "grok.com" || host.ends_with(".grok.com"))
+        {
+            return ResponsesFlavor::Grok;
+        }
         if host_is_xai(&host) {
             ResponsesFlavor::Xai
         } else {
@@ -1365,9 +1369,9 @@ mod tests {
         assert_eq!(grok.base_url, "https://cli-chat-proxy.grok.com/v1");
         assert_eq!(grok.auth, AuthMode::XaiOauth);
         assert!(grok.api_key_env.is_none());
-        // The grok.com host isn't an x.ai host, so the flavor keys on the
-        // auth mode — it still speaks the xai Responses dialect.
-        assert_eq!(config.responses_flavor("grok"), ResponsesFlavor::Xai);
+        // The Grok flavor keys on the CLI proxy host and enables
+        // proxy-only capabilities.
+        assert_eq!(config.responses_flavor("grok"), ResponsesFlavor::Grok);
         // The default config validates: the bearer-leak guard allows grok.com.
         assert!(config.validate().is_ok());
     }
