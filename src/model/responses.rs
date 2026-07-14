@@ -801,43 +801,58 @@ pub fn map_error_value(value: &Value, status: StatusCode) -> Value {
 // of failing the turn, so it must reach the client as its own status rather
 // than folding into a generic `api_error`.
 
-/// Map an upstream HTTP status to the Anthropic error envelope's
-/// `error.type`, per the table in `docs/gateway-protocol.md#error-envelopes`.
-/// Shared by every translated backend (Responses/Codex, xAI, Cursor) so they
-/// surface the same vocabulary the Anthropic-direct path streams verbatim.
-pub fn anthropic_error_type(status: StatusCode) -> &'static str {
+/// Single source of truth mapping an upstream HTTP status to both the Anthropic
+/// error envelope's `error.type` and the client-facing HTTP status.
+///
+/// Deriving both from one table makes their shared invariant unbreakable: a
+/// status can never be given a specific `error.type` (e.g. `permission_error`)
+/// while its client-facing status silently falls back to `502`, which would
+/// ship a self-contradictory envelope. `anthropic_error_type` and
+/// `client_facing_status` are thin projections of this table.
+///
+/// The standard error statuses (400/401/403/413/429/500/501/502/503/504 and the
+/// non-registry 529 overload) reach the client unchanged so status-based client
+/// behavior (the `529` overload backoff, distinguishing `503`/`500` from a
+/// generic gateway failure) sees the real upstream signal. Anything outside that
+/// set collapses to `(api_error, 502)` rather than leaking an unexpected
+/// upstream status verbatim. See `docs/gateway-protocol.md#error-envelopes`.
+/// The second tuple element is whether the upstream `status` reaches the client
+/// unchanged (`true`) or collapses to `502` (`false`); `client_facing_status`
+/// projects it. Encoding it as a flag rather than repeating the `StatusCode` in
+/// both the pattern and the return keeps each row's status listed once.
+fn mapped_error(status: StatusCode) -> (&'static str, bool) {
     match status {
-        StatusCode::BAD_REQUEST => "invalid_request_error",
-        StatusCode::UNAUTHORIZED => "authentication_error",
-        StatusCode::FORBIDDEN => "permission_error",
-        StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
-        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
-        StatusCode::NOT_IMPLEMENTED => "not_supported",
-        _ if status.as_u16() == 529 => "overloaded_error",
-        _ => "api_error",
+        StatusCode::BAD_REQUEST => ("invalid_request_error", true),
+        StatusCode::UNAUTHORIZED => ("authentication_error", true),
+        StatusCode::FORBIDDEN => ("permission_error", true),
+        StatusCode::PAYLOAD_TOO_LARGE => ("request_too_large", true),
+        StatusCode::TOO_MANY_REQUESTS => ("rate_limit_error", true),
+        StatusCode::INTERNAL_SERVER_ERROR => ("api_error", true),
+        StatusCode::NOT_IMPLEMENTED => ("not_supported", true),
+        StatusCode::BAD_GATEWAY => ("api_error", true),
+        StatusCode::SERVICE_UNAVAILABLE => ("api_error", true),
+        StatusCode::GATEWAY_TIMEOUT => ("api_error", true),
+        _ if status.as_u16() == 529 => ("overloaded_error", true),
+        _ => ("api_error", false),
     }
 }
 
+/// Map an upstream HTTP status to the Anthropic error envelope's `error.type`,
+/// per the table in `docs/gateway-protocol.md#error-envelopes`. Shared by every
+/// translated backend (Responses/Codex, xAI, Cursor) so they surface the same
+/// vocabulary the Anthropic-direct path streams verbatim. Projection of
+/// `mapped_error`.
+pub fn anthropic_error_type(status: StatusCode) -> &'static str {
+    mapped_error(status).0
+}
+
 /// Client-facing HTTP status for a mapped upstream error. The standard error
-/// statuses reach the client unchanged so status-based client behavior (the
-/// `529` overload backoff, distinguishing `503`/`500` from a generic gateway
-/// failure) sees the real upstream signal; anything outside that set
-/// collapses to `502` rather than leaking an unexpected upstream status
-/// verbatim.
+/// statuses (400/401/403/413/429/500/501/502/503/504 and the non-registry 529
+/// overload) reach the client unchanged; anything else collapses to `502`
+/// rather than leaking an unexpected upstream status verbatim. Projection of
+/// `mapped_error`, the shared source of truth this and `error.type` derive from.
 pub fn client_facing_status(status: StatusCode) -> StatusCode {
-    const PRESERVED: &[StatusCode] = &[
-        StatusCode::BAD_REQUEST,
-        StatusCode::UNAUTHORIZED,
-        StatusCode::FORBIDDEN,
-        StatusCode::PAYLOAD_TOO_LARGE,
-        StatusCode::TOO_MANY_REQUESTS,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        StatusCode::NOT_IMPLEMENTED,
-        StatusCode::BAD_GATEWAY,
-        StatusCode::SERVICE_UNAVAILABLE,
-        StatusCode::GATEWAY_TIMEOUT,
-    ];
-    if PRESERVED.contains(&status) || status.as_u16() == 529 {
+    if mapped_error(status).1 {
         status
     } else {
         StatusCode::BAD_GATEWAY
