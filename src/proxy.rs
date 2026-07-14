@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::IntoResponse,
 };
+use serde_json::Value;
 use tracing::Instrument;
 
 use crate::{
@@ -131,6 +132,7 @@ async fn forward(
                 response: UpstreamError::from_message(message).into_response(),
             }
         })?;
+    let body = normalize_request_body(body.to_vec());
     let route = routing::resolve(&state.config, &body).map_err(|error| ForwardError {
         message: "failed to route request".to_string(),
         response: error.into_response(),
@@ -167,7 +169,6 @@ async fn forward(
             CountTokens::Estimate => count_tokens_unsupported(),
         });
     }
-    let body = body.to_vec();
     let provider = route.provider.clone();
     let model = route.model.clone();
     let result = match route.adapter {
@@ -273,6 +274,50 @@ pub(crate) fn is_count_tokens(uri: &Uri) -> bool {
     uri.path().ends_with("/count_tokens")
 }
 
+fn normalize_request_body(body: Vec<u8>) -> Vec<u8> {
+    let Ok(mut request) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    normalize_empty_text_blocks(&mut request);
+    serde_json::to_vec(&request).unwrap_or(body)
+}
+
+pub(crate) fn normalize_empty_text_blocks(request: &mut Value) {
+    let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let original = content.clone();
+        content.retain(|block| !is_empty_text_block(block));
+        if content.is_empty() {
+            // Reaching here means *every* block was empty text: a message with
+            // no text, tool_use, or thinking at all. The #132 poisoned turns
+            // (tool-only / reasoning-only) always carry a surviving tool_use or
+            // thinking block, so the adapter never produces this shape — it is a
+            // degenerate case only. Anthropic rejects both an empty `content`
+            // array and an empty text block, and dropping the message would
+            // break user/assistant alternation, so there is no local transform
+            // that makes such a message valid. We keep the first block as a
+            // last resort rather than risk an alternation error; the block may
+            // still be empty (see the `keeps_one_block...` test).
+            if let Some(block) = original.into_iter().next() {
+                content.push(block);
+            }
+        }
+    }
+}
+
+fn is_empty_text_block(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.trim().is_empty())
+}
+
 fn count_tokens_unsupported() -> (StatusCode, axum::response::Response) {
     let status = StatusCode::NOT_IMPLEMENTED;
     (
@@ -289,8 +334,9 @@ fn count_tokens_unsupported() -> (StatusCode, axum::response::Response) {
 #[cfg(test)]
 mod tests {
     use axum::http::Uri;
+    use serde_json::json;
 
-    use super::is_count_tokens;
+    use super::{is_count_tokens, is_empty_text_block, normalize_empty_text_blocks};
 
     #[test]
     fn detects_count_tokens_path() {
@@ -303,5 +349,53 @@ mod tests {
                 .unwrap()
         ));
         assert!(!is_count_tokens(&"/v1/messages".parse::<Uri>().unwrap()));
+    }
+
+    #[test]
+    fn strips_empty_text_blocks_and_preserves_other_content() {
+        let mut body = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "  \n"},
+                    {"type": "thinking", "thinking": "reason"},
+                    {"type": "tool_use", "id": "tool_1", "name": "work", "input": {}}
+                ]
+            }]
+        });
+
+        normalize_empty_text_blocks(&mut body);
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                {"type": "thinking", "thinking": "reason"},
+                {"type": "tool_use", "id": "tool_1", "name": "work", "input": {}}
+            ])
+        );
+    }
+
+    // A message whose content is *only* empty text is a degenerate shape the
+    // #132 adapter path never produces (tool-only / reasoning-only turns always
+    // keep a tool_use or thinking block). Anthropic rejects both an empty
+    // `content` array and an empty text block, and dropping the message would
+    // break role alternation, so normalization keeps one block rather than risk
+    // an alternation error — meaning the surviving block may itself still be
+    // empty. This test pins that known limitation so the fallback is not
+    // mistaken for a fix that guarantees a non-empty survivor.
+    #[test]
+    fn keeps_one_block_for_an_all_empty_text_message_even_if_still_empty() {
+        let mut body = json!({
+            "messages": [{"role": "assistant", "content": [{"type": "text", "text": "  "}]}]
+        });
+
+        normalize_empty_text_blocks(&mut body);
+
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "must never leave an empty content array");
+        // Known limitation: with no non-empty block to fall back to, the
+        // surviving block is still the empty text block.
+        assert!(is_empty_text_block(&content[0]));
     }
 }

@@ -231,7 +231,7 @@ impl AnthropicSseMachine {
     fn output_item_added(&mut self, data: &Value) -> Vec<String> {
         let item = data.get("item").unwrap_or(data);
         match item.get("type").and_then(Value::as_str) {
-            Some("message") => self.open_text(),
+            Some("message") => Vec::new(),
             Some("function_call") => self.open_tool(item),
             Some("reasoning") => self.reasoning_added(item),
             _ => Vec::new(),
@@ -430,8 +430,11 @@ impl AnthropicSseMachine {
             index: self.index,
             kind: BlockKind::Text,
         });
+        // Do NOT clear `text_citations` here: `annotation_added` can buffer a
+        // citation before the first `text_delta` opens the block, and
+        // `close_any` already clears the buffer when a text block closes. A
+        // clear at open time would drop those pre-delta citations.
         self.text_buffer.clear();
-        self.text_citations.clear();
         out.push(sse(
             "content_block_start",
             &json!({
@@ -440,6 +443,20 @@ impl AnthropicSseMachine {
                 "content_block": {"type": "text", "text": ""}
             }),
         ));
+        // Flush any citations buffered before this block opened. `annotation_added`
+        // stores a citation but can't stream its `citations_delta` while no text
+        // block is open, so emit them now that the block exists — otherwise
+        // streaming clients only ever see them in the final reconstructed block.
+        for citation in &self.text_citations {
+            out.push(sse(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": self.index,
+                    "delta": {"type": "citations_delta", "citation": citation}
+                }),
+            ));
+        }
         out
     }
 
@@ -481,15 +498,20 @@ impl AnthropicSseMachine {
         if delta.is_empty() {
             return Vec::new();
         }
+        let mut out = Vec::new();
+        if self.open.as_ref().map(|block| block.kind) != Some(BlockKind::Text) {
+            out.extend(self.open_text());
+        }
         self.text_buffer.push_str(delta);
-        vec![sse(
+        out.push(sse(
             "content_block_delta",
             &json!({
                 "type": "content_block_delta",
                 "index": self.open_index(),
                 "delta": {"type": "text_delta", "text": delta}
             }),
-        )]
+        ));
+        out
     }
 
     fn annotation_added(&mut self, data: &Value) -> Vec<String> {
@@ -498,9 +520,6 @@ impl AnthropicSseMachine {
             return Vec::new();
         }
         let mut out = Vec::new();
-        if self.open.as_ref().map(|block| block.kind) != Some(BlockKind::Text) {
-            out.extend(self.open_text());
-        }
         let url = annotation.get("url").and_then(Value::as_str).unwrap_or("");
         let encrypted_index = annotation
             .get("encrypted_index")
@@ -529,6 +548,9 @@ impl AnthropicSseMachine {
             .expect("citation is an object")
             .retain(|_, value| !value.is_null());
         self.text_citations.push(citation.clone());
+        if self.open.as_ref().map(|block| block.kind) != Some(BlockKind::Text) {
+            return out;
+        }
         out.push(sse(
             "content_block_delta",
             &json!({
@@ -633,11 +655,19 @@ impl AnthropicSseMachine {
         };
         match open.kind {
             BlockKind::Text => {
-                let mut block = json!({"type": "text", "text": self.text_buffer});
-                if !self.text_citations.is_empty() {
-                    block["citations"] = json!(self.text_citations);
+                // Drop a whitespace-only text block from the reconstructed
+                // `content` (Anthropic rejects empty text blocks), but still
+                // emit the matching `content_block_stop` below and advance the
+                // index: `open_text` already streamed a `content_block_start`
+                // for this block, so suppressing the stop would leave an
+                // unbalanced block and make the next block reuse this index.
+                if !self.text_buffer.trim().is_empty() {
+                    let mut block = json!({"type": "text", "text": self.text_buffer});
+                    if !self.text_citations.is_empty() {
+                        block["citations"] = json!(self.text_citations);
+                    }
+                    self.content.push(block);
                 }
-                self.content.push(block);
                 self.text_buffer.clear();
                 self.text_citations.clear();
             }
@@ -938,4 +968,218 @@ pub fn context_overflow_message(value: &Value, message: &str) -> Option<String> 
 
 fn sse(event: &str, data: &Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(name: &str, data: Value) -> ResponseEvent {
+        ResponseEvent {
+            event: Some(name.to_string()),
+            data,
+        }
+    }
+
+    #[test]
+    fn tool_only_turn_does_not_emit_empty_text_block() {
+        let mut machine = AnthropicSseMachine::new("test", false, false);
+        let mut output = Vec::new();
+        output.extend(machine.apply(event(
+            "response.output_item.added",
+            json!({"item": {"type": "function_call", "call_id": "call_1", "name": "do_work"}}),
+        )));
+        output.extend(machine.apply(event(
+            "response.function_call_arguments.delta",
+            json!({"delta": "{}"}),
+        )));
+        output.extend(machine.apply(event("response.function_call_arguments.done", json!({}))));
+        output.extend(machine.apply(event(
+            "response.output_item.done",
+            json!({"item": {"type": "function_call"}}),
+        )));
+        output.extend(machine.finish());
+        let final_json = machine.final_json();
+
+        assert!(output.iter().all(|frame| {
+            !frame.contains("\"type\":\"text\"") && !frame.contains("\"text\":\"\"")
+        }));
+        assert!(final_json["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "text"));
+    }
+
+    #[test]
+    fn reasoning_only_turn_does_not_emit_empty_text_block() {
+        let mut machine = AnthropicSseMachine::new("test", true, false);
+        let mut output = machine.apply(event(
+            "response.output_item.added",
+            json!({"item": {"type": "reasoning", "id": "reason_1"}}),
+        ));
+        output.extend(machine.apply(event(
+            "response.reasoning_summary_text.delta",
+            json!({"delta": "Thinking"}),
+        )));
+        output.extend(machine.apply(event(
+            "response.output_item.done",
+            json!({"item": {"type": "reasoning", "id": "reason_1"}}),
+        )));
+        output.extend(machine.finish());
+        let final_json = machine.final_json();
+
+        assert!(output.iter().all(|frame| {
+            !frame.contains("\"type\":\"text\"") && !frame.contains("\"text\":\"\"")
+        }));
+        assert!(final_json["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "text"));
+    }
+
+    #[test]
+    fn text_turn_still_streams_text_content() {
+        let mut machine = AnthropicSseMachine::new("test", false, false);
+        let mut output = machine.apply(event(
+            "response.output_item.added",
+            json!({"item": {"type": "message"}}),
+        ));
+        output.extend(machine.apply(event(
+            "response.output_text.delta",
+            json!({"delta": "Hello"}),
+        )));
+        output.extend(machine.apply(event("response.output_text.done", json!({}))));
+        output.extend(machine.finish());
+        let final_json = machine.final_json();
+
+        assert!(output.iter().any(|frame| frame.contains("text_delta")));
+        assert_eq!(
+            final_json["content"][0],
+            json!({"type": "text", "text": "Hello"})
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_keeps_the_sse_stream_balanced() {
+        // A whitespace-only delta still opens a text block (open_text streams a
+        // content_block_start), so closing it must emit the matching
+        // content_block_stop and advance the index. Otherwise the following
+        // tool block reuses the same index and the first block is never closed.
+        let mut machine = AnthropicSseMachine::new("test", false, false);
+        let mut output = machine.apply(event(
+            "response.output_item.added",
+            json!({"item": {"type": "message"}}),
+        ));
+        output.extend(machine.apply(event("response.output_text.delta", json!({"delta": "  "}))));
+        output.extend(machine.apply(event(
+            "response.output_item.added",
+            json!({"item": {"type": "function_call", "call_id": "call_1", "name": "do_work"}}),
+        )));
+        output.extend(machine.apply(event(
+            "response.function_call_arguments.delta",
+            json!({"delta": "{}"}),
+        )));
+        output.extend(machine.apply(event("response.function_call_arguments.done", json!({}))));
+        output.extend(machine.apply(event(
+            "response.output_item.done",
+            json!({"item": {"type": "function_call"}}),
+        )));
+        output.extend(machine.finish());
+        let final_json = machine.final_json();
+
+        let starts = output
+            .iter()
+            .filter(|frame| frame.contains("event: content_block_start"))
+            .count();
+        let stops = output
+            .iter()
+            .filter(|frame| frame.contains("event: content_block_stop"))
+            .count();
+        assert_eq!(starts, stops, "every content_block_start needs a stop");
+
+        // No two content_block_start frames may share an index.
+        let start_indexes: Vec<&str> = output
+            .iter()
+            .filter(|frame| frame.contains("event: content_block_start"))
+            .map(|frame| {
+                let marker = "\"index\":";
+                let start = frame.find(marker).unwrap() + marker.len();
+                let rest = &frame[start..];
+                let end = rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        let mut unique = start_indexes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            start_indexes.len(),
+            unique.len(),
+            "content_block_start indexes must be distinct"
+        );
+
+        // The whitespace-only text block is still dropped from `content`.
+        assert!(final_json["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "text"));
+    }
+
+    #[test]
+    fn citation_before_first_text_delta_is_preserved() {
+        // `annotation.added` can arrive before the first `output_text.delta`.
+        // It buffers the citation in `text_citations`; the subsequent
+        // `open_text` must not clear that buffer, or the pre-delta citation is
+        // lost from the reconstructed text block.
+        let mut machine = AnthropicSseMachine::new("test", false, false);
+        let mut output = machine.apply(event(
+            "response.output_item.added",
+            json!({"item": {"type": "message"}}),
+        ));
+        output.extend(machine.apply(event(
+            "response.output_text.annotation.added",
+            json!({"annotation": {
+                "type": "url_citation",
+                "url": "https://example.com",
+                "title": "Example",
+                "cited_text": "quoted"
+            }}),
+        )));
+        output.extend(machine.apply(event(
+            "response.output_text.delta",
+            json!({"delta": "Hello"}),
+        )));
+        output.extend(machine.apply(event("response.output_text.done", json!({}))));
+        output.extend(machine.finish());
+        let final_json = machine.final_json();
+
+        // The buffered citation survives into the final reconstructed block...
+        assert_eq!(
+            final_json["content"][0],
+            json!({
+                "type": "text",
+                "text": "Hello",
+                "citations": [{
+                    "type": "web_search_result_location",
+                    "url": "https://example.com",
+                    "title": "Example",
+                    "cited_text": "quoted"
+                }]
+            })
+        );
+        // ...and streaming clients also receive it as a `citations_delta`, flushed
+        // when the lazily-opened text block starts.
+        assert!(
+            output
+                .iter()
+                .any(|frame| frame.contains("citations_delta")
+                    && frame.contains("https://example.com")),
+            "pre-delta citation must be streamed as a citations_delta frame"
+        );
+    }
 }
