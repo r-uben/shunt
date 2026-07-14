@@ -22,7 +22,7 @@ use crate::{
     server::AppState,
 };
 
-use super::error::{mapped_upstream_error, own_error};
+use super::error::{backend_error_response, mapped_upstream_error, own_error};
 use super::request::request_builder;
 
 /// Send the upstream Responses HTTP request and return the raw response
@@ -94,16 +94,18 @@ pub(super) async fn forward_http(
             ),
         ))
     } else {
-        Ok((
-            StatusCode::OK,
-            json_response(
-                upstream,
-                route.model.clone(),
-                thinking_enabled,
-                tool_search_native,
-            )
-            .await?,
-        ))
+        // Thread the real response status: `json_response` returns a `502` when
+        // a backend error event surfaced via `backend_error` (issue #113), so
+        // the proxy's access log (`upstream_status`) and `record_proxied_request`
+        // metrics reflect the failure instead of a hardcoded `200`.
+        let response = json_response(
+            upstream,
+            route.model.clone(),
+            thinking_enabled,
+            tool_search_native,
+        )
+        .await?;
+        Ok((response.status(), response))
     }
 }
 
@@ -162,6 +164,14 @@ pub(super) fn stream_response(
         .into_response()
 }
 
+/// Collect the full HTTP Responses SSE body into a single Anthropic message for
+/// a non-streaming client. A backend-sent `error` / `response.failed` event
+/// (delivered as a normal event on the `200 OK` stream — rate-limit,
+/// content-policy refusal) is surfaced as a gateway error rather than a `200 OK`
+/// with the partial content accumulated before it, so the client cannot mistake
+/// a backend failure for a truncated-but-successful result (issue #113). This
+/// mirrors the streaming path, which emits the same error inline as an SSE
+/// `error` event.
 pub(super) async fn json_response(
     upstream: reqwest::Response,
     model: String,
@@ -175,6 +185,9 @@ pub(super) async fn json_response(
     let mut machine = AnthropicSseMachine::new(model, thinking_enabled, tool_search_native);
     for event in parse_sse_events(&body) {
         let _ = machine.apply(event);
+    }
+    if let Some(error) = machine.take_backend_error() {
+        return Ok(backend_error_response(error));
     }
     Ok((StatusCode::OK, axum::Json(machine.final_json())).into_response())
 }
@@ -207,6 +220,84 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Serves `body` at `status` from a mock server and returns the resulting
+    /// `reqwest::Response`, mirroring the shape `json_response` reads in
+    /// production (a response off the wire, not built in-process).
+    async fn upstream_response(status: u16, body: &str) -> reqwest::Response {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/e"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body.to_string()))
+            .mount(&server)
+            .await;
+        reqwest::Client::new()
+            .get(format!("{}/e", server.uri()))
+            .send()
+            .await
+            .expect("mock request should succeed")
+    }
+
+    async fn response_body_json(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        serde_json::from_slice(&bytes).expect("response body should be JSON")
+    }
+
+    /// A backend-sent `response.failed` event on the HTTP JSON path surfaces as a
+    /// `502` gateway error rather than a `200 OK` with the partial content
+    /// collected before it (issue #113).
+    #[tokio::test]
+    async fn json_response_surfaces_backend_error_event_as_gateway_error() {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"partial\"}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit reached\"}}}\n\n",
+        );
+        let upstream = upstream_response(200, sse).await;
+        let response = json_response(upstream, "gpt-5.2-codex".to_string(), false, false)
+            .await
+            .expect("json_response builds a response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response_body_json(response).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["message"], "Rate limit reached");
+    }
+
+    /// A clean turn still returns the collected Anthropic message as `200 OK` —
+    /// the backend-error gate must not regress the success path.
+    #[tokio::test]
+    async fn json_response_returns_ok_for_a_clean_turn() {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"item\":{\"type\":\"message\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"hello\"}\n\n",
+            "event: response.output_text.done\n",
+            "data: {}\n\n",
+            "event: response.completed\n",
+            "data: {\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let upstream = upstream_response(200, sse).await;
+        let response = json_response(upstream, "gpt-5.2-codex".to_string(), false, false)
+            .await
+            .expect("json_response builds a response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body_json(response).await;
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["content"][0]["text"], "hello");
+    }
 
     /// A multi-byte code point split across two transport chunks must survive
     /// intact. Decoding each chunk with `from_utf8_lossy` in isolation would

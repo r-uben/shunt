@@ -17,6 +17,7 @@ use crate::{
 };
 
 use super::codex_ws::{CodexWsError, CodexWsEvents};
+use super::error::backend_error_response;
 use super::websocket::BufferedEvent;
 
 /// Stream translated events to the client as Anthropic SSE. Mirrors
@@ -92,11 +93,16 @@ pub(super) fn stream_events_response(
 /// is mid-stream: return a gateway error instead of presenting partial output as
 /// a successful response. `buffered` is the replayed first event, if any.
 ///
-/// Note the asymmetry: a mid-stream *transport* error surfaces as a gateway
-/// error, but a backend-sent error *event* (arriving as `Ok`, e.g. rate-limit or
-/// content-policy) is currently applied by `machine` like any other event and not
-/// surfaced as a gateway error — a pre-existing limitation shared with the HTTP
-/// `json_response` path, tracked separately.
+/// A backend-sent error *event* (arriving as `Ok`, e.g. rate-limit or
+/// content-policy refusal) is likewise surfaced as a gateway error rather than a
+/// `200 OK` with the partial content collected before it (issue #113): the
+/// machine records the mapped error envelope. Because such an event is terminal
+/// (the machine ignores everything after it), the collector returns the moment
+/// the envelope is recorded rather than draining to channel close — a backend
+/// that sends the error but holds the socket open would otherwise hang the
+/// request on `recv()`. This matches both the mid-stream *transport* error above
+/// and the streaming path, which emits the same error inline as an SSE `error`
+/// event.
 pub(super) async fn json_events_response(
     buffered: BufferedEvent,
     mut events: CodexWsEvents,
@@ -114,6 +120,13 @@ pub(super) async fn json_events_response(
         match item {
             Some(Ok(event)) => {
                 let _ = machine.apply(event);
+                // A backend error event is terminal: the machine records the
+                // mapped envelope and ignores everything after. Return the moment
+                // it lands instead of looping on `recv()` for a channel close the
+                // backend may never send — that would hang the request.
+                if let Some(error) = machine.take_backend_error() {
+                    return backend_error_response(error);
+                }
             }
             Some(Err(error)) => {
                 tracing::warn!(error = %error.message, "codex websocket stream error");
@@ -216,6 +229,74 @@ mod tests {
         let response =
             json_events_response(None, rx, "gpt-5.2-codex".to_string(), false, false).await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A backend-sent error *event* (an `Ok` on the channel, distinct from a
+    /// transport `Err`) is surfaced as a `502` gateway error, mirroring the HTTP
+    /// `json_response` path (issue #113). A partial content delta precedes the
+    /// failure so the "error after real content" case is exercised too.
+    #[tokio::test]
+    async fn json_events_response_surfaces_backend_error_event_as_gateway_error() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Ok(created_event())).unwrap();
+        tx.send(Ok(ResponseEvent {
+            event: Some("response.output_text.delta".to_string()),
+            data: json!({ "delta": "partial" }),
+        }))
+        .unwrap();
+        tx.send(Ok(ResponseEvent {
+            event: Some("response.failed".to_string()),
+            data: json!({
+                "type": "response.failed",
+                "response": { "error": { "code": "rate_limit_exceeded", "message": "Rate limit reached" } }
+            }),
+        }))
+        .unwrap();
+        drop(tx);
+
+        let response =
+            json_events_response(None, rx, "gpt-5.2-codex".to_string(), false, false).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["message"], "Rate limit reached");
+    }
+
+    /// The collector must not block waiting for the channel to close after a
+    /// backend error event — a backend can send `response.failed` and hold the
+    /// socket open. Keep the sender alive (no `drop(tx)`) and assert the collector
+    /// still returns a `502` promptly instead of hanging on `recv()`.
+    #[tokio::test]
+    async fn json_events_response_returns_on_backend_error_without_channel_close() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Ok(created_event())).unwrap();
+        tx.send(Ok(ResponseEvent {
+            event: Some("response.failed".to_string()),
+            data: json!({
+                "type": "response.failed",
+                "response": { "error": { "code": "rate_limit_exceeded", "message": "Rate limit reached" } }
+            }),
+        }))
+        .unwrap();
+        // Deliberately keep `tx` alive: the channel never closes, so the collector
+        // must return on the error event rather than looping forever on `recv()`.
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            json_events_response(None, rx, "gpt-5.2-codex".to_string(), false, false),
+        )
+        .await
+        .expect("collector returns without waiting for channel close");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["message"], "Rate limit reached");
+
+        drop(tx);
     }
 
     #[tokio::test]

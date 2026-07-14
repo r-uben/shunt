@@ -89,17 +89,18 @@ pub(super) async fn forward_websocket(
             ),
         ))
     } else {
-        Ok((
-            StatusCode::OK,
-            json_events_response(
-                buffered,
-                events,
-                route.model.clone(),
-                thinking_enabled,
-                tool_search_native,
-            )
-            .await,
-        ))
+        // See `forward_http`: surface the real status (a `502` when a backend
+        // error event fired, issue #113) to the access log and metrics rather
+        // than a hardcoded `200`.
+        let response = json_events_response(
+            buffered,
+            events,
+            route.model.clone(),
+            thinking_enabled,
+            tool_search_native,
+        )
+        .await;
+        Ok((response.status(), response))
     }
 }
 

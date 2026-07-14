@@ -172,7 +172,11 @@ pub(super) async fn forward_chatgpt_oauth(
                         tool_search_native,
                     )
                     .await?;
-                    return Ok((StatusCode::OK, with_account_header(response, &account.name)));
+                    let response = with_account_header(response, &account.name);
+                    // Surface the real status (a `502` when a backend error event
+                    // fired on the non-streaming path, issue #113) to the access
+                    // log and metrics rather than a hardcoded `200`.
+                    return Ok((response.status(), response));
                 }
                 // A non-failover 4xx (e.g. 400) is a client error, not the
                 // account's fault: relay it (re-shaped into the Anthropic error
@@ -313,10 +317,10 @@ pub(super) async fn forward_chatgpt_oauth(
                                 tool_search_native,
                             )
                             .await?;
-                            return Ok((
-                                StatusCode::OK,
-                                with_account_header(response, &account.name),
-                            ));
+                            let response = with_account_header(response, &account.name);
+                            // Surface the real status (issue #113) rather than a
+                            // hardcoded `200` — see the relay arm above.
+                            return Ok((response.status(), response));
                         }
                         return Err(mapped_upstream_error(retry_status, retry, auth).await);
                     }
