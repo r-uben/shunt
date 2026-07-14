@@ -136,7 +136,7 @@ pub(super) async fn forward_chatgpt_oauth(
             &route,
             credential.clone(),
             session_id.as_deref(),
-            &upstream_body,
+            bytes::Bytes::from(upstream_body.to_string()),
         )
         .await
         {
@@ -148,7 +148,7 @@ pub(super) async fn forward_chatgpt_oauth(
                 tracing::warn!(
                     provider = %route.provider,
                     account = %account.name,
-                    error = %error.message,
+                    error = %error,
                     "ChatGPT OAuth upstream request failed"
                 );
                 continue;
@@ -261,7 +261,7 @@ pub(super) async fn forward_chatgpt_oauth(
                     &route,
                     retry_credential,
                     session_id.as_deref(),
-                    &upstream_body,
+                    bytes::Bytes::from(upstream_body.to_string()),
                 )
                 .await
                 {
@@ -275,7 +275,7 @@ pub(super) async fn forward_chatgpt_oauth(
                         tracing::warn!(
                             provider = %route.provider,
                             account = %account.name,
-                            error = %error.message,
+                            error = %error,
                             "ChatGPT OAuth refresh retry failed"
                         );
                         last_response = Some(upstream);
