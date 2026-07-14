@@ -9,7 +9,10 @@
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -39,6 +42,46 @@ pub fn is_token_valid_at(token: &str, now: SystemTime) -> bool {
     jwt_exp(token)
         .and_then(|exp| exp.checked_sub(EXPIRY_BUFFER))
         .is_some_and(|refresh_at| now < refresh_at)
+}
+
+/// Whether the long-lived `refresh_token` may be POSTed to `url`: HTTPS anywhere,
+/// or plain `http://` only to loopback. Vets the initial URL and each redirect hop.
+fn is_safe_refresh_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        || (url.scheme() == "http"
+            && crate::config::host_is_loopback(url.host_str().unwrap_or_default()))
+}
+
+/// Resolve an OAuth refresh endpoint from a `SHUNT_*_TOKEN_URL` override; an empty,
+/// malformed, or unsafe one (see [`is_safe_refresh_url`]) falls back to `default_url`.
+pub(crate) fn sanitize_token_url(raw: Option<String>, default_url: &str) -> String {
+    raw.filter(|value| !value.is_empty())
+        .filter(|value| {
+            value
+                .parse::<reqwest::Url>()
+                .is_ok_and(|url| is_safe_refresh_url(&url))
+        })
+        .unwrap_or_else(|| default_url.to_string())
+}
+
+/// Process-wide client for the OAuth refresh POST; follows a 3xx only to a safe
+/// endpoint ([`is_safe_refresh_url`]), closing [`sanitize_token_url`]'s initial-URL gap.
+pub(crate) fn token_refresh_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() >= 10 || !is_safe_refresh_url(attempt.url()) {
+                        attempt.error("unsafe or excessive token refresh redirect refused")
+                    } else {
+                        attempt.follow()
+                    }
+                }))
+                .build()
+                .expect("build redirect-hardened token refresh client")
+        })
+        .clone()
 }
 
 pub(crate) fn write_auth_file_atomic(path: &Path, value: &Value) -> io::Result<()> {
@@ -172,6 +215,55 @@ pub fn scan_account_dir(
     Ok(accounts)
 }
 
+/// Resolve a pooled provider's effective account list: its configured
+/// `[[accounts]]` when non-empty, otherwise a per-request scan of the store
+/// directory (which enables no-restart account discovery, mirroring the
+/// Anthropic pool). The existence probe and the scan both do synchronous
+/// filesystem I/O, so they run together on the blocking pool — never a stat or
+/// `read_dir` on a runtime worker thread. When `accounts_dir` is genuinely absent
+/// (a `NotFound` stat) — the backward-compat deployment that sets
+/// `auth = "..._oauth"` but never runs `shunt login` — the scan is short-circuited
+/// right after that cheap stat (no `read_dir`, no per-file reads), preserving the
+/// near-zero-I/O single-account path (#118). Any *other* stat error (e.g. a
+/// permission fault on an existing but unreadable store) is surfaced rather than
+/// masked as "no accounts", mirroring `scan_account_dir`'s own `NotFound`-only
+/// handling and preserving the pre-#118 guarantee that a broken store is
+/// diagnosable. The check runs on every request, so once an account is added
+/// (which creates the directory) scanning resumes with no restart.
+/// `provider_label` shapes the error text only ("codex" / "Claude"); the error is
+/// returned preformatted so each pool wraps it in its own gateway error type.
+pub(crate) async fn resolve_pool_accounts(
+    provider_label: &str,
+    configured: &[AccountConfig],
+    accounts_dir: PathBuf,
+    scan: fn() -> io::Result<Vec<AccountConfig>>,
+) -> Result<Vec<AccountConfig>, String> {
+    if !configured.is_empty() {
+        return Ok(configured.to_vec());
+    }
+    // The stat + scan are both synchronous file I/O, so run the whole thing on
+    // the blocking pool — never on a runtime worker thread. The closure still
+    // short-circuits on genuine absence (a cheap stat, no `read_dir`); any other
+    // stat error is surfaced, not masked as "no accounts".
+    let scan_dir = accounts_dir.clone();
+    let scanned = tokio::task::spawn_blocking(move || {
+        match fs::metadata(&scan_dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        }
+        scan()
+    })
+    .await
+    .map_err(|error| format!("{provider_label} account store scan task failed: {error}"))?;
+    scanned.map_err(|error| {
+        format!(
+            "failed to scan {provider_label} account store {}: {error}",
+            accounts_dir.display()
+        )
+    })
+}
+
 /// Write an account file born-private: create its parent directory `0700` on Unix
 /// (no chmod-after-create window on a multi-user host), then atomically write
 /// `value` via [`write_auth_file_atomic`]. Both stores import credentials this way.
@@ -216,6 +308,32 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     let m = mp + if mp < 10 { 3 } else { -9 };
     let y = y + if m <= 2 { 1 } else { 0 };
     (y, m, d)
+}
+
+/// Test-only RAII guard that sets an environment variable on construction and
+/// removes it on drop, so a panic between set and cleanup cannot leak the
+/// override into a sibling test. Shared by the Claude and Codex store test
+/// modules — both drive `SHUNT_*_ACCOUNTS_DIR` — so their cleanup cannot drift.
+/// Pair it with each store's `TEST_ENV_LOCK` (declare the guard *after* the lock
+/// so it drops first, removing the var while the lock is still held).
+#[cfg(test)]
+pub(crate) struct EnvVarGuard {
+    key: &'static str,
+}
+
+#[cfg(test)]
+impl EnvVarGuard {
+    pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        env::set_var(key, value);
+        Self { key }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        env::remove_var(self.key);
+    }
 }
 
 #[cfg(test)]
@@ -280,6 +398,80 @@ mod tests {
     fn scan_account_dir_missing_dir_is_empty() {
         let dir = temp_dir("missing").join("does-not-exist");
         assert!(scan_account_dir(&dir, |_| None).unwrap().is_empty());
+    }
+
+    fn one_account() -> io::Result<Vec<AccountConfig>> {
+        Ok(vec![AccountConfig {
+            name: "primary".to_string(),
+            credentials: None,
+            token_env: None,
+            uuid: None,
+        }])
+    }
+
+    fn scan_must_not_run() -> io::Result<Vec<AccountConfig>> {
+        panic!("the store scan must be short-circuited");
+    }
+
+    #[tokio::test]
+    async fn resolve_pool_accounts_short_circuits_when_store_dir_absent() {
+        // No configured accounts and no store directory (the backward-compat
+        // single-account deployment): the scan is skipped entirely, so a scan fn
+        // that would panic is never reached and the list is empty.
+        let missing = temp_dir("pool-absent").join("does-not-exist");
+        let accounts = resolve_pool_accounts("codex", &[], missing, scan_must_not_run)
+            .await
+            .unwrap();
+        assert!(accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_pool_accounts_scans_when_store_dir_exists() {
+        // Once the store directory exists (an operator added an account), the
+        // scan runs on every request — no-restart discovery is preserved.
+        let dir = temp_dir("pool-present");
+        fs::create_dir_all(&dir).unwrap();
+        let accounts = resolve_pool_accounts("codex", &[], dir.clone(), one_account)
+            .await
+            .unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].name, "primary");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_pool_accounts_prefers_configured_without_scanning() {
+        // Configured `[[accounts]]` win outright: the scan is never invoked even
+        // when a store directory exists alongside them.
+        let dir = temp_dir("pool-configured");
+        fs::create_dir_all(&dir).unwrap();
+        let configured = one_account().unwrap();
+        let accounts = resolve_pool_accounts("codex", &configured, dir.clone(), scan_must_not_run)
+            .await
+            .unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].name, "primary");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_pool_accounts_maps_scan_error_with_label_and_path() {
+        // A scan that fails (e.g. an unreadable store) surfaces a provider-labelled
+        // error naming the directory, so each pool can wrap it verbatim.
+        fn scan_fails() -> io::Result<Vec<AccountConfig>> {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+        }
+        let dir = temp_dir("pool-scan-error");
+        fs::create_dir_all(&dir).unwrap();
+        let error = resolve_pool_accounts("codex", &[], dir.clone(), scan_fails)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("failed to scan codex account store"),
+            "got: {error}"
+        );
+        assert!(error.contains(&dir.display().to_string()), "got: {error}");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
