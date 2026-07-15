@@ -7,11 +7,12 @@
 //! into a sibling provider's module.
 
 use std::{
+    collections::HashMap,
     env, fs, io,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        OnceLock,
+        Mutex, OnceLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -275,11 +276,12 @@ pub fn scan_account_dir(
 }
 
 /// Resolve a pooled provider's effective account list: its configured
-/// `[[accounts]]` when non-empty, otherwise a per-request scan of the store
-/// directory (which enables no-restart account discovery, mirroring the
-/// Anthropic pool). The existence probe and the scan both do synchronous
-/// filesystem I/O, so they run together on the blocking pool — never a stat or
-/// `read_dir` on a runtime worker thread. When `accounts_dir` is genuinely absent
+/// `[[accounts]]` when non-empty, otherwise a scan of the store directory
+/// (cached by its mtime — see [`scan_cached`]) that enables no-restart account
+/// discovery, mirroring the Anthropic pool. The existence probe and the scan
+/// both do synchronous filesystem I/O, so they run together on the blocking
+/// pool — never a stat or `read_dir` on a runtime worker thread. When
+/// `accounts_dir` is genuinely absent
 /// (a `NotFound` stat) — the backward-compat deployment that sets
 /// `auth = "..._oauth"` but never runs `shunt login` — the scan is short-circuited
 /// right after that cheap stat (no `read_dir`, no per-file reads), preserving the
@@ -288,9 +290,18 @@ pub fn scan_account_dir(
 /// masked as "no accounts", mirroring `scan_account_dir`'s own `NotFound`-only
 /// handling and preserving the pre-#118 guarantee that a broken store is
 /// diagnosable. The check runs on every request, so once an account is added
-/// (which creates the directory) scanning resumes with no restart.
-/// `provider_label` shapes the error text only ("codex" / "Claude"); the error is
-/// returned preformatted so each pool wraps it in its own gateway error type.
+/// (which creates the directory) scanning resumes with no restart. The
+/// `read_dir` + per-account UUID reads are cached by the store directory's mtime
+/// (see [`scan_cached`]): an unchanged store re-serves the last scan, so
+/// steady-state account-list discovery costs one stat and zero credential-file
+/// reads, while adding or removing an account changes the directory mtime and so
+/// re-scans on the next request — preserving no-restart discovery. (Directory
+/// mtime is the invalidation signal, so on a filesystem with coarse mtime
+/// resolution a change that shares the cached scan's timestamp goes unnoticed
+/// until a later change advances the mtime.)
+/// `provider_label` shapes the error text ("codex" / "Claude") and partitions the
+/// scan cache (see [`scan_cache`]); the error is returned preformatted so each
+/// pool wraps it in its own gateway error type.
 pub(crate) async fn resolve_pool_accounts(
     provider_label: &str,
     configured: &[AccountConfig],
@@ -305,13 +316,18 @@ pub(crate) async fn resolve_pool_accounts(
     // short-circuits on genuine absence (a cheap stat, no `read_dir`); any other
     // stat error is surfaced, not masked as "no accounts".
     let scan_dir = accounts_dir.clone();
+    let provider = provider_label.to_string();
     let scanned = tokio::task::spawn_blocking(move || {
-        match fs::metadata(&scan_dir) {
-            Ok(_) => {}
+        // One stat serves two purposes: the #118 `NotFound` short-circuit (no
+        // `read_dir` when the store is genuinely absent) and the cache signal
+        // (the store directory's mtime). Reusing it keeps steady-state discovery
+        // at one stat and zero credential-file reads.
+        let modified = match fs::metadata(&scan_dir) {
+            Ok(meta) => meta.modified().ok(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error),
-        }
-        scan()
+        };
+        scan_cached(&provider, &scan_dir, modified, scan)
     })
     .await
     .map_err(|error| format!("{provider_label} account store scan task failed: {error}"))?;
@@ -321,6 +337,71 @@ pub(crate) async fn resolve_pool_accounts(
             accounts_dir.display()
         )
     })
+}
+
+/// One cached scan result: the accounts a scan produced and the store directory
+/// mtime it was produced against. A later request whose stat reports the same
+/// mtime reuses `accounts` verbatim.
+struct CachedScan {
+    modified: SystemTime,
+    accounts: Vec<AccountConfig>,
+}
+
+/// Process-wide cache of [`scan_account_dir`] results, keyed by
+/// `(provider, store directory path)`. Both stores share the map but never read
+/// each other's entries: the provider label is part of the key, so even two
+/// stores pointed at the same directory (their UUID semantics differ) stay
+/// separate. The cache primarily spares the Claude store its per-account UUID
+/// reads — a cache hit does zero credential-file reads.
+fn scan_cache() -> &'static Mutex<HashMap<(String, PathBuf), CachedScan>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, PathBuf), CachedScan>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Return the cached scan for `dir` when its stored mtime still matches
+/// `modified`; otherwise run `scan`, cache the result against `modified`, and
+/// return it. `modified` is the store directory's mtime, sampled *before* the
+/// scan so a change racing the scan is caught by the next request rather than
+/// masked. When `modified` is `None` (a platform/filesystem that reports no
+/// mtime) the cache is bypassed and every call scans, so correctness never
+/// depends on a signal we could not read.
+fn scan_cached(
+    provider: &str,
+    dir: &Path,
+    modified: Option<SystemTime>,
+    scan: impl Fn() -> io::Result<Vec<AccountConfig>>,
+) -> io::Result<Vec<AccountConfig>> {
+    let Some(modified) = modified else {
+        return scan();
+    };
+    let key = (provider.to_string(), dir.to_path_buf());
+    {
+        let cache = scan_cache().lock().expect("scan cache mutex poisoned");
+        if let Some(entry) = cache.get(&key) {
+            if entry.modified == modified {
+                return Ok(entry.accounts.clone());
+            }
+        }
+    }
+    // Cache miss (first sight, or the store changed): scan without holding the
+    // lock so concurrent hits are never blocked behind this file I/O, then
+    // record the result. Concurrent misses each scan and race to insert; the
+    // last write wins, and their snapshots may differ if the store changed while
+    // they overlapped. That is safe: an entry is served only while its stored
+    // mtime equals the mtime this request sampled, so a stale write is re-scanned
+    // away as soon as a request observes a different directory mtime.
+    let accounts = scan()?;
+    scan_cache()
+        .lock()
+        .expect("scan cache mutex poisoned")
+        .insert(
+            key,
+            CachedScan {
+                modified,
+                accounts: accounts.clone(),
+            },
+        );
+    Ok(accounts)
 }
 
 /// Write an account file born-private: create its parent directory `0700` on Unix
@@ -539,7 +620,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_pool_accounts_scans_when_store_dir_exists() {
         // Once the store directory exists (an operator added an account), the
-        // scan runs on every request — no-restart discovery is preserved.
+        // first request scans and caches it — no-restart discovery is preserved.
         let dir = temp_dir("pool-present");
         fs::create_dir_all(&dir).unwrap();
         let accounts = resolve_pool_accounts("codex", &[], dir.clone(), one_account)
@@ -582,6 +663,124 @@ mod tests {
             "got: {error}"
         );
         assert!(error.contains(&dir.display().to_string()), "got: {error}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn account_names(accounts: &[AccountConfig]) -> Vec<&str> {
+        accounts
+            .iter()
+            .map(|account| account.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn scan_cached_serves_cache_until_mtime_changes_and_bypasses_without_mtime() {
+        // Drive the cache with explicit mtimes (no reliance on filesystem mtime
+        // resolution), checking both how often the underlying scan runs and which
+        // account set is served. The directory path is unique per test, so the
+        // process-wide cache map cannot collide with a sibling test.
+        let dir = temp_dir("scan-cached");
+        let calls = AtomicUsize::new(0);
+        // The scan's result grows with the store: the first mtime yields one
+        // account, a later mtime yields two — so an invalidation that re-scans
+        // but keeps the stale list is distinguishable from one that refreshes it.
+        let scan = || {
+            let mut accounts = vec![AccountConfig {
+                name: "primary".to_string(),
+                ..Default::default()
+            }];
+            if calls.fetch_add(1, Ordering::Relaxed) >= 1 {
+                accounts.push(AccountConfig {
+                    name: "secondary".to_string(),
+                    ..Default::default()
+                });
+            }
+            Ok(accounts)
+        };
+        let t1 = UNIX_EPOCH + Duration::from_secs(1_000);
+
+        // First sight: cache miss, scans once, returns the one-account set.
+        assert_eq!(
+            account_names(&scan_cached("codex", &dir, Some(t1), scan).unwrap()),
+            ["primary"]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Unchanged mtime: cache hit — no scan, same set (0 credential-file reads).
+        assert_eq!(
+            account_names(&scan_cached("codex", &dir, Some(t1), scan).unwrap()),
+            ["primary"]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Store changed (mtime advanced): invalidate, re-scan, and the REFRESHED
+        // set replaces the stale one — proving invalidation updates the cached
+        // value, not merely that it re-scans.
+        let t2 = t1 + Duration::from_secs(1);
+        assert_eq!(
+            account_names(&scan_cached("codex", &dir, Some(t2), scan).unwrap()),
+            ["primary", "secondary"]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        // The refreshed set is now what a hit serves (still no further scan).
+        assert_eq!(
+            account_names(&scan_cached("codex", &dir, Some(t2), scan).unwrap()),
+            ["primary", "secondary"]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        // A different provider at the same path scans its own entry rather than
+        // borrowing Codex's — the shared map never serves one provider's scan to
+        // another.
+        assert_eq!(
+            account_names(&scan_cached("Claude", &dir, Some(t2), scan).unwrap()),
+            ["primary", "secondary"]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        // A second Claude call at the same mtime hits Claude's own entry: no
+        // re-scan, so the count holds — proving the entry is retained, not shared.
+        assert_eq!(
+            account_names(&scan_cached("Claude", &dir, Some(t2), scan).unwrap()),
+            ["primary", "secondary"]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        // No mtime signal: the cache is bypassed and every call scans.
+        scan_cached("codex", &dir, None, scan).unwrap();
+        scan_cached("codex", &dir, None, scan).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+    }
+
+    static POOL_CACHE_SCAN_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_scan() -> io::Result<Vec<AccountConfig>> {
+        POOL_CACHE_SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+        one_account()
+    }
+
+    #[tokio::test]
+    async fn resolve_pool_accounts_caches_scan_across_unchanged_requests() {
+        // With an unchanged store, a second pooled request re-serves the cached
+        // scan: the underlying scan runs once, so steady-state discovery does no
+        // repeat `read_dir` or per-account reads.
+        let dir = temp_dir("pool-cache-hit");
+        fs::create_dir_all(&dir).unwrap();
+        POOL_CACHE_SCAN_CALLS.store(0, Ordering::Relaxed);
+
+        let first = resolve_pool_accounts("codex", &[], dir.clone(), counting_scan)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(POOL_CACHE_SCAN_CALLS.load(Ordering::Relaxed), 1);
+
+        let second = resolve_pool_accounts("codex", &[], dir.clone(), counting_scan)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(POOL_CACHE_SCAN_CALLS.load(Ordering::Relaxed), 1);
+
         let _ = fs::remove_dir_all(dir);
     }
 
