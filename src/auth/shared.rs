@@ -17,12 +17,40 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand::RngCore;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::AccountConfig;
 
 const EXPIRY_BUFFER: Duration = Duration::from_secs(5 * 60);
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// A freshly generated PKCE verifier/challenge plus an independent OAuth state.
+pub(crate) struct PkceChallenge {
+    pub verifier: String,
+    pub challenge: String,
+    pub state: String,
+}
+
+/// Generate a fresh PKCE verifier + S256 challenge and an independent `state`,
+/// each 32 random bytes URL-safe base64 (no padding).
+pub(crate) fn generate_pkce() -> PkceChallenge {
+    let verifier = random_urlsafe(32);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let state = random_urlsafe(32);
+    PkceChallenge {
+        verifier,
+        challenge,
+        state,
+    }
+}
+
+fn random_urlsafe(bytes: usize) -> String {
+    let mut random = vec![0_u8; bytes];
+    rand::rng().fill_bytes(&mut random);
+    URL_SAFE_NO_PAD.encode(random)
+}
 
 pub fn jwt_claims(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
@@ -62,6 +90,38 @@ pub(crate) fn sanitize_token_url(raw: Option<String>, default_url: &str) -> Stri
                 .is_ok_and(|url| is_safe_refresh_url(&url))
         })
         .unwrap_or_else(|| default_url.to_string())
+}
+
+/// The admin-web counterpart to [`sanitize_token_url`]: resolve a `SHUNT_*_TOKEN_URL`
+/// override for the browser completion flow, but **warn** on an invalid or unsafe
+/// override instead of falling back silently. The completion handler consumes the
+/// single-use OAuth authorization code, so an operator who typos a local-testing
+/// override would otherwise burn their real code against the production endpoint with
+/// no trace in the logs. `env_var` names the override so one message serves every
+/// provider; the raw value is never logged (it may embed credentials in userinfo —
+/// `https://user:pass@host`), only its scheme/host, which is all the guard turns on.
+pub(crate) fn admin_token_url_override(env_var: &str, default_url: &str) -> String {
+    let Some(raw) = env::var(env_var).ok().filter(|value| !value.is_empty()) else {
+        return default_url.to_string();
+    };
+    let Ok(url) = raw.parse::<reqwest::Url>() else {
+        tracing::warn!(
+            env = env_var,
+            "admin: ignoring token URL override (not a valid URL)"
+        );
+        return default_url.to_string();
+    };
+    if is_safe_refresh_url(&url) {
+        raw
+    } else {
+        tracing::warn!(
+            env = env_var,
+            scheme = url.scheme(),
+            host = url.host_str().unwrap_or_default(),
+            "admin: ignoring token URL override (only https, or http to loopback, is allowed)"
+        );
+        default_url.to_string()
+    }
 }
 
 /// Process-wide client for the OAuth refresh POST; follows a 3xx only to a safe
@@ -351,6 +411,26 @@ mod tests {
     }
 
     #[test]
+    fn generated_pkce_values_are_urlsafe_and_s256_linked() {
+        use sha2::{Digest, Sha256};
+
+        let pkce = generate_pkce();
+        assert_eq!(pkce.verifier.len(), 43);
+        assert_eq!(pkce.challenge.len(), 43);
+        assert_eq!(pkce.state.len(), 43);
+        assert_eq!(
+            pkce.challenge,
+            URL_SAFE_NO_PAD.encode(Sha256::digest(pkce.verifier.as_bytes()))
+        );
+        for value in [&pkce.verifier, &pkce.challenge, &pkce.state] {
+            assert!(value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'));
+        }
+        assert_ne!(pkce.verifier, pkce.state);
+    }
+
+    #[test]
     fn validate_account_name_accepts_kebab_and_rejects_the_rest() {
         for ok in ["primary", "a", "a-1", "backup-2"] {
             assert!(validate_account_name(ok).is_ok(), "rejected {ok:?}");
@@ -370,6 +450,40 @@ mod tests {
             PathBuf::from("/tmp/shunt-shared-override")
         );
         std::env::remove_var(&env_name);
+    }
+
+    #[test]
+    fn admin_token_url_override_returns_safe_overrides_and_falls_back_otherwise() {
+        // A per-pid var name no other test reads, so no cross-test env race.
+        let env_name = format!("SHUNT_TEST_ADMIN_TOKEN_URL_{}", std::process::id());
+        let default = "https://auth.example.com/oauth/token";
+
+        // Unset and empty both fall back to the built-in default.
+        env::remove_var(&env_name);
+        assert_eq!(admin_token_url_override(&env_name, default), default);
+        env::set_var(&env_name, "");
+        assert_eq!(admin_token_url_override(&env_name, default), default);
+
+        // Safe overrides are honored: https anywhere, or http to loopback.
+        env::set_var(&env_name, "https://localhost:9999/token");
+        assert_eq!(
+            admin_token_url_override(&env_name, default),
+            "https://localhost:9999/token"
+        );
+        env::set_var(&env_name, "http://127.0.0.1:9999/token");
+        assert_eq!(
+            admin_token_url_override(&env_name, default),
+            "http://127.0.0.1:9999/token"
+        );
+
+        // A malformed URL, or http to a non-loopback host, is ignored (with a warn)
+        // and the default is used — no silent egress of the one-time code.
+        env::set_var(&env_name, "not a url");
+        assert_eq!(admin_token_url_override(&env_name, default), default);
+        env::set_var(&env_name, "http://evil.example.com/token");
+        assert_eq!(admin_token_url_override(&env_name, default), default);
+
+        env::remove_var(&env_name);
     }
 
     #[test]

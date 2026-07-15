@@ -6,12 +6,13 @@
 //! `[server.admin]` admin tokens add upstream accounts. Browsers authenticate with
 //! a session cookie minted after a login form and are CSRF-protected; API/curl
 //! callers pass the admin token header and are CSRF-exempt (no ambient cookie).
-//! The provisioning flow reuses the CLI Claude OAuth internals for both full
-//! refreshable logins and inference-only setup tokens; token values are never
-//! returned to the browser or logged. See `docs/m9-admin-surface.md`.
+//! The provisioning flow reuses provider OAuth internals for Claude full/setup
+//! logins and refreshable ChatGPT/Codex logins; token values are never returned
+//! to the browser or logged. See `docs/m9-admin-surface.md`.
 
 pub mod session;
 
+mod codex;
 mod html;
 
 use std::{sync::Arc, time::Duration};
@@ -100,24 +101,36 @@ pub fn admin_router() -> Router<AppState> {
             "/admin/accounts/claude/{name}",
             delete(remove_account_handler),
         )
+        .route(
+            "/admin/accounts/codex",
+            get(codex::list_codex_accounts).post(codex::add_codex_account),
+        )
+        .route(
+            "/admin/accounts/codex/{name}/complete",
+            post(codex::complete_codex_account),
+        )
+        .route(
+            "/admin/accounts/codex/{name}",
+            delete(codex::remove_codex_account_handler),
+        )
 }
 
 /// How a request authenticated, which decides whether CSRF applies.
-enum Authenticated {
+pub(super) enum Authenticated {
     /// Admin token header (API/curl): no ambient cookie, so CSRF-exempt.
     Header,
     /// Session cookie (browser): CSRF-protected.
     Session { csrf: String },
 }
 
-struct AuthOk {
-    kind: Authenticated,
-    auth: Arc<AdminAuth>,
+pub(super) struct AuthOk {
+    pub(super) kind: Authenticated,
+    pub(super) auth: Arc<AdminAuth>,
 }
 
 /// Resolve the request's admin authentication, or `None` when unauthenticated (or
 /// the admin surface has been disabled by a reload).
-fn authenticate(state: &AppState, headers: &HeaderMap) -> Option<AuthOk> {
+pub(super) fn authenticate(state: &AppState, headers: &HeaderMap) -> Option<AuthOk> {
     let auth = state.admin_auth.clone()?;
     if auth.authenticate_header(headers) {
         return Some(AuthOk {
@@ -137,7 +150,7 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Option<AuthOk> {
 /// the session's CSRF token. Header-token callers are exempt. Returns the
 /// rejection response when the check fails, or `None` when the request may
 /// proceed.
-fn check_csrf(kind: &Authenticated, headers: &HeaderMap) -> Option<Response> {
+pub(super) fn check_csrf(kind: &Authenticated, headers: &HeaderMap) -> Option<Response> {
     let Authenticated::Session { csrf } = kind else {
         return None;
     };
@@ -152,6 +165,18 @@ fn check_csrf(kind: &Authenticated, headers: &HeaderMap) -> Option<Response> {
         None
     } else {
         Some(forbidden("missing or invalid CSRF token"))
+    }
+}
+
+/// Drop process-lifetime pool health for `account` across every provider using
+/// `auth`, so re-provisioning does not inherit stale cooldown/quota state — while
+/// leaving other auth modes' identically-named accounts untouched (the Claude and
+/// Codex stores independently allow the same account name).
+pub(super) fn forget_pool_health(state: &AppState, auth: AuthMode, account: &str) {
+    for (provider_name, provider) in &state.config.providers {
+        if provider.auth == auth {
+            state.accounts.forget_account(provider_name, account);
+        }
     }
 }
 
@@ -389,14 +414,22 @@ async fn pool(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let mut providers = Vec::new();
         for (name, provider) in &config.providers {
-            if provider.auth != AuthMode::ClaudeOauth {
+            if !matches!(
+                provider.auth,
+                AuthMode::ClaudeOauth | AuthMode::ChatgptOauth
+            ) {
                 continue;
             }
             let resolved = if provider.accounts.is_empty() {
                 // Surface a store read failure as an error (5xx) instead of an
                 // empty pool: a permission/I/O problem must not masquerade as
                 // "no accounts configured" on the dashboard.
-                claude_store::scan_accounts().map_err(|error| {
+                let scanned = match provider.auth {
+                    AuthMode::ClaudeOauth => claude_store::scan_accounts(),
+                    AuthMode::ChatgptOauth => crate::auth::codex::store::scan_accounts(),
+                    _ => unreachable!("provider auth filtered above"),
+                };
+                scanned.map_err(|error| {
                     tracing::error!(provider = %name, %error, "admin: failed to scan accounts store");
                     format!("failed to scan accounts store for provider {name}")
                 })?
@@ -539,6 +572,7 @@ async fn complete_account(
     let expires_in = match pending.kind {
         PendingKind::SetupToken => Some(claude_login::SETUP_TOKEN_EXPIRES_SECS),
         PendingKind::FullOauth => None,
+        PendingKind::CodexOauth => return internal("unexpected codex pending on the claude route"),
     };
     let token_url = admin_token_url();
     let tokens = match claude_login::exchange_code(
@@ -611,6 +645,7 @@ async fn complete_account(
             })
             .await
         }
+        PendingKind::CodexOauth => return internal("unexpected codex pending on the claude route"),
     };
     // The OAuth code is already consumed (single-use) by the time we get here, so
     // a persist failure is unrecoverable for this attempt — log the real cause
@@ -628,9 +663,9 @@ async fn complete_account(
     }
     state.admin_stores.pending.remove(&name);
     // Re-provisioning reuses the account name; clear any process-lifetime pool
-    // health carried over from a prior token so the fresh credential is not
-    // treated as cooling/near-quota.
-    state.accounts.forget(&name);
+    // health carried over from a prior Claude token so the fresh credential is
+    // not treated as cooling/near-quota, without touching same-named Codex health.
+    forget_pool_health(&state, AuthMode::ClaudeOauth, &name);
     tracing::info!(account = %name, "admin: account stored");
 
     // Empty-accounts providers scan the store per request → live immediately;
@@ -652,6 +687,9 @@ async fn complete_account(
         }
         (PendingKind::FullOauth, false) => {
             "Refreshable OAuth login stored. Add a name-only [[providers.<name>.accounts]] entry and reload to activate it."
+        }
+        (PendingKind::CodexOauth, _) => {
+            return internal("unexpected codex pending on the claude route")
         }
     };
     json_secure(json!({ "name": name, "stored": true, "live": live, "message": message }))
@@ -687,9 +725,9 @@ async fn remove_account_handler(
         }
     };
     tracing::info!(account = %name, removed, "admin: account removed");
-    // Drop any process-lifetime pool health for the removed name so a later
-    // re-add does not inherit stale cooldown/quota state.
-    state.accounts.forget(&name);
+    // Drop process-lifetime Claude pool health for the removed name so a later
+    // re-add does not inherit stale cooldown/quota state, without touching Codex.
+    forget_pool_health(&state, AuthMode::ClaudeOauth, &name);
     json_secure(json!({ "name": name, "removed": removed }))
 }
 
@@ -700,33 +738,7 @@ async fn remove_account_handler(
 /// loopback host (the integration tests point it at a local wiremock). Anything
 /// else is ignored with a warning and the built-in endpoint is used instead.
 fn admin_token_url() -> String {
-    let default = || claude_auth::TOKEN_URL.to_string();
-    let Some(raw) = std::env::var("SHUNT_CLAUDE_TOKEN_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
-        return default();
-    };
-    // Never log the raw URL — it may embed credentials in userinfo
-    // (`https://user:pass@host`); the rejection turns only on scheme/host, so
-    // log just those.
-    let Ok(url) = raw.parse::<reqwest::Url>() else {
-        tracing::warn!("admin: ignoring SHUNT_CLAUDE_TOKEN_URL (not a valid URL)");
-        return default();
-    };
-    let allowed = url.scheme() == "https"
-        || (url.scheme() == "http"
-            && crate::config::host_is_loopback(url.host_str().unwrap_or_default()));
-    if allowed {
-        raw
-    } else {
-        tracing::warn!(
-            scheme = url.scheme(),
-            host = url.host_str().unwrap_or_default(),
-            "admin: ignoring SHUNT_CLAUDE_TOKEN_URL (only https, or http to loopback, is allowed)"
-        );
-        default()
-    }
+    crate::auth::shared::admin_token_url_override("SHUNT_CLAUDE_TOKEN_URL", claude_auth::TOKEN_URL)
 }
 
 // --- response helpers ----------------------------------------------------------
@@ -761,7 +773,7 @@ base-uri 'none'; frame-ancestors 'none'";
 /// A JSON API response carrying admin data, with the same no-sniff / no-store
 /// guards as the HTML pages — account metadata and pool state are sensitive and
 /// must not be MIME-sniffed or cached by the browser or a shared intermediary.
-fn json_secure(value: serde_json::Value) -> Response {
+pub(super) fn json_secure(value: serde_json::Value) -> Response {
     (
         [
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
@@ -776,7 +788,7 @@ fn redirect(location: &'static str) -> Response {
     (StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response()
 }
 
-fn unauthorized() -> Response {
+pub(super) fn unauthorized() -> Response {
     ShuntError::new(
         StatusCode::UNAUTHORIZED,
         "authentication_error",
@@ -789,19 +801,19 @@ fn forbidden(message: &str) -> Response {
     ShuntError::new(StatusCode::FORBIDDEN, "permission_error", message).into_response()
 }
 
-fn bad_request(message: &str) -> Response {
+pub(super) fn bad_request(message: &str) -> Response {
     ShuntError::new(StatusCode::BAD_REQUEST, "invalid_request_error", message).into_response()
 }
 
-fn internal(message: &str) -> Response {
+pub(super) fn internal(message: &str) -> Response {
     ShuntError::new(StatusCode::INTERNAL_SERVER_ERROR, "api_error", message).into_response()
 }
 
-fn bad_gateway(message: &str) -> Response {
+pub(super) fn bad_gateway(message: &str) -> Response {
     ShuntError::bad_gateway(message).into_response()
 }
 
-fn too_many_requests(message: &str) -> Response {
+pub(super) fn too_many_requests(message: &str) -> Response {
     ShuntError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message).into_response()
 }
 
