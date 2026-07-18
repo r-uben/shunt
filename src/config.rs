@@ -121,6 +121,17 @@ pub struct PoolConfig {
     /// [`crate::state_persist`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_path: Option<PathBuf>,
+    /// Storm control (issue #195): cap concurrent admissions to an account
+    /// identity that just started taking traffic, so a failover switch cannot
+    /// stampede the freshly selected account with every in-flight request at
+    /// once. The cap starts here and doubles per successful response
+    /// (slow-start), and drops back after a cooldown or an idle period. Unset
+    /// or `0` disables admission gating (the default). A pool whose accounts
+    /// all resolve to one upstream identity is effectively ungated: the last
+    /// remaining candidate is always admitted so gating can never fail a
+    /// request, and a single-identity pool only ever has a last candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ramp_initial_concurrency: Option<u32>,
 }
 
 pub(crate) fn default_hard_threshold() -> f64 {
@@ -138,6 +149,7 @@ impl Default for PoolConfig {
             burn_rate_avoidance: false,
             usage_refresh_seconds: None,
             state_path: None,
+            ramp_initial_concurrency: None,
         }
     }
 }
@@ -149,6 +161,12 @@ impl PoolConfig {
             None | Some(0) => None,
             Some(seconds) => Some(seconds.max(60)),
         }
+    }
+
+    /// The storm-control initial admission allowance, or `None` when admission
+    /// gating is disabled (unset or `0`).
+    pub fn storm_ramp_initial(&self) -> Option<u32> {
+        self.ramp_initial_concurrency.filter(|&initial| initial > 0)
     }
 }
 
@@ -1711,6 +1729,16 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// The effective storm-control initial admission allowance
+    /// (`[server.pool] ramp_initial_concurrency`), or `None` when no pool is
+    /// configured or the gate is disabled.
+    pub fn storm_ramp_initial(&self) -> Option<u32> {
+        self.server
+            .pool
+            .as_ref()
+            .and_then(PoolConfig::storm_ramp_initial)
+    }
+
     /// Whether the Codex Responses WebSocket v2 transport should be used for
     /// `provider`. Requires both the opt-in `websocket` flag and the ChatGPT/Codex
     /// backend: only that backend serves the `responses_websockets` v2 endpoint,
@@ -2035,7 +2063,7 @@ mod tests {
     #[test]
     fn pool_config_and_account_thresholds_parse_from_toml() {
         let pool: PoolConfig = figment::Figment::from(figment::providers::Toml::string(
-            "default_threshold = 0.85\nburn_rate_avoidance = true",
+            "default_threshold = 0.85\nburn_rate_avoidance = true\nramp_initial_concurrency = 4",
         ))
         .extract()
         .unwrap();
@@ -2043,6 +2071,12 @@ mod tests {
         assert_eq!(pool.default_threshold, Some(0.85));
         assert_eq!(pool.default_threshold_5h, None);
         assert!(pool.burn_rate_avoidance);
+        assert_eq!(pool.ramp_initial_concurrency, Some(4));
+        assert_eq!(
+            PoolConfig::default().ramp_initial_concurrency,
+            None,
+            "storm control defaults to disabled"
+        );
 
         let account: AccountConfig = figment::Figment::from(figment::providers::Toml::string(
             "name = \"backup\"\nthreshold = 0.5\nthreshold_fable = 0.4\npriority = 10\ndisabled = true",
@@ -2061,6 +2095,17 @@ mod tests {
         assert_eq!(bare.threshold, None);
         assert_eq!(bare.priority, 100, "serde default");
         assert!(!bare.disabled);
+    }
+
+    #[test]
+    fn storm_ramp_initial_treats_zero_and_absent_as_disabled() {
+        for (configured, expected) in [(None, None), (Some(0), None), (Some(5), Some(5))] {
+            let pool = PoolConfig {
+                ramp_initial_concurrency: configured,
+                ..Default::default()
+            };
+            assert_eq!(pool.storm_ramp_initial(), expected, "{configured:?}");
+        }
     }
 
     #[test]
