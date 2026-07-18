@@ -165,6 +165,15 @@ const H = {{ "content-type": "application/json", "x-csrf-token": CSRF }};
 const $ = (id) => document.getElementById(id);
 function esc(v) {{ return v === null || v === undefined ? "" : String(v); }}
 function pct(v) {{ return v === null || v === undefined ? "—" : Math.round(v * 100) + "%"; }}
+function untilShort(resetSecs) {{
+  const mins = Math.ceil((resetSecs * 1000 - Math.min(Date.now(), resetSecs * 1000)) / 60000);
+  if (mins <= 0) return "now";
+  const d = Math.floor(mins / 1440), h = Math.floor((mins % 1440) / 60), m = mins % 60;
+  return d > 0 ? (h > 0 ? d + "d " + h + "h" : d + "d") : h > 0 ? (m > 0 ? h + "h " + m + "m" : h + "h") : m + "m";
+}}
+function pctReset(v, resetSecs) {{
+  return resetSecs ? pct(v) + " · " + untilShort(resetSecs) : pct(v);
+}}
 function when(ms) {{ return ms ? new Date(ms).toLocaleString() : "—"; }}
 function cell(row, text, mono) {{ const td = document.createElement("td"); td.textContent = esc(text);
   if (mono) td.className = "mono"; row.appendChild(td); return td; }}
@@ -215,7 +224,12 @@ async function loadPool() {{
     rows++; const r = body.insertRow();
     cell(r, p.provider); cell(r, a.name);
     cell(r, a.disabled ? "disabled" : !a.has_state ? "unseen" : a.near_quota ? "near quota" : a.cooldown_secs_remaining ? "cooling" : "available");
-    cell(r, pct(a.utilization_5h)); cell(r, pct(a.utilization_7d)); cell(r, pct(a.utilization_7d_oi));
+    const c5 = cell(r, pctReset(a.utilization_5h, a.reset_5h));
+    if (a.reset_5h) c5.title = "resets " + new Date(a.reset_5h * 1000).toLocaleString();
+    const c7 = cell(r, pctReset(a.utilization_7d, a.reset_7d));
+    if (a.reset_7d) c7.title = "resets " + new Date(a.reset_7d * 1000).toLocaleString();
+    const c7oi = cell(r, pctReset(a.utilization_7d_oi, a.reset_7d_oi));
+    if (a.reset_7d_oi) c7oi.title = "resets " + new Date(a.reset_7d_oi * 1000).toLocaleString();
     cell(r, a.status || "—");
     cell(r, a.cooldown_secs_remaining ? a.cooldown_secs_remaining + "s" : "—");
   }}
