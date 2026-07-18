@@ -315,6 +315,7 @@ mod tests {
             policies: None,
             telemetry: None,
             state_path: Some(path.clone()),
+            oidc: None,
         });
         let state = AppState::new(config, reqwest::Client::new()).expect("gateway config resolves");
 

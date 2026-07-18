@@ -8,16 +8,20 @@
 
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use super::{approval::Identity, refresh::RefreshTokenStore};
+use super::{
+    approval::Identity, idp_client::DiscoveredEndpoints, refresh::RefreshTokenStore, ResolvedIdp,
+};
 
 pub const DEVICE_CODE_TTL: Duration = Duration::from_secs(600);
+pub const OIDC_STATE_TTL: Duration = Duration::from_secs(600);
 pub const INITIAL_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 const MAX_DEVICE_GRANTS: usize = 4096;
+const MAX_OIDC_STATES: usize = 4096;
 const MAX_RATE_LIMIT_IDENTITIES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +106,22 @@ impl DeviceGrantStore {
         self.set_status_at(user_code, DeviceStatus::Approved(identity), Instant::now())
     }
 
+    pub fn pending_exists(&self, user_code: &str) -> bool {
+        self.pending_exists_at(user_code, Instant::now())
+    }
+
+    fn pending_exists_at(&self, user_code: &str, now: Instant) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("gateway device-grant lock poisoned");
+        state
+            .by_user_code
+            .get(user_code)
+            .and_then(|device_code| state.grants.get(device_code))
+            .is_some_and(|grant| grant.expires > now && grant.status == DeviceStatus::Pending)
+    }
+
     pub fn deny(&self, user_code: &str) -> bool {
         self.set_status_at(user_code, DeviceStatus::Denied, Instant::now())
     }
@@ -175,6 +195,96 @@ fn sweep_expired_grants(state: &mut DeviceGrantState, now: Instant) {
     }
 }
 
+#[derive(Clone)]
+pub struct OidcPending {
+    pub user_code: String,
+    pub verifier: String,
+    pub idp: Arc<ResolvedIdp>,
+    pub redirect_uri: String,
+    expires: Instant,
+}
+
+#[derive(Default)]
+pub struct OidcStateStore {
+    states: Mutex<HashMap<String, OidcPending>>,
+}
+
+impl OidcStateStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(
+        &self,
+        state: String,
+        user_code: String,
+        verifier: String,
+        idp: Arc<ResolvedIdp>,
+        redirect_uri: String,
+    ) -> bool {
+        self.insert_at(
+            state,
+            user_code,
+            verifier,
+            idp,
+            redirect_uri,
+            Instant::now(),
+            OIDC_STATE_TTL,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_at(
+        &self,
+        state: String,
+        user_code: String,
+        verifier: String,
+        idp: Arc<ResolvedIdp>,
+        redirect_uri: String,
+        now: Instant,
+        ttl: Duration,
+    ) -> bool {
+        let mut states = self
+            .states
+            .lock()
+            .expect("gateway OIDC-state lock poisoned");
+        states.retain(|_, pending| pending.expires > now);
+        if states.contains_key(&state) {
+            return false;
+        }
+        // Keep exactly one active browser authorization per device grant. A
+        // second click replaces the old state so an abandoned tab cannot later
+        // deny or approve the same grant independently.
+        states.retain(|_, pending| pending.user_code != user_code);
+        if states.len() >= MAX_OIDC_STATES {
+            return false;
+        }
+        states.insert(
+            state,
+            OidcPending {
+                user_code,
+                verifier,
+                idp,
+                redirect_uri,
+                expires: now + ttl,
+            },
+        );
+        true
+    }
+
+    pub fn take(&self, state: &str) -> Option<OidcPending> {
+        self.take_at(state, Instant::now())
+    }
+
+    fn take_at(&self, state: &str, now: Instant) -> Option<OidcPending> {
+        self.states
+            .lock()
+            .expect("gateway OIDC-state lock poisoned")
+            .remove(state)
+            .filter(|pending| pending.expires > now)
+    }
+}
+
 struct RateLimitEntry {
     window_start: Instant,
     count: u32,
@@ -228,6 +338,9 @@ pub struct GatewayStores {
     pub device_grants: DeviceGrantStore,
     pub refresh_tokens: RefreshTokenStore,
     pub device_verify_rate: PerIpRateLimiter,
+    pub oidc_states: OidcStateStore,
+    pub oidc_discovery: Mutex<HashMap<String, DiscoveredEndpoints>>,
+    pub oidc_client: reqwest::Client,
 }
 
 impl GatewayStores {
@@ -236,6 +349,12 @@ impl GatewayStores {
             device_grants: DeviceGrantStore::new(),
             refresh_tokens: RefreshTokenStore::new(),
             device_verify_rate: PerIpRateLimiter::new(Duration::from_secs(60), 30),
+            oidc_states: OidcStateStore::new(),
+            oidc_discovery: Mutex::new(HashMap::new()),
+            oidc_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("OIDC HTTP client configuration is valid"),
         }
     }
 }
@@ -258,11 +377,26 @@ mod tests {
         }
     }
 
+    fn idp() -> Arc<ResolvedIdp> {
+        Arc::new(ResolvedIdp {
+            issuer: "https://idp.example".into(),
+            client_id: "client".into(),
+            client_secret: "secret".into(),
+            allowed_domains: vec!["example.com".into()],
+            allowed_emails: vec![],
+            scopes: vec!["openid".into()],
+            authorization_endpoint: None,
+            token_endpoint: None,
+            userinfo_endpoint: None,
+        })
+    }
+
     #[test]
     fn device_grant_transitions_and_is_single_use() {
         let store = DeviceGrantStore::new();
         let now = Instant::now();
         assert!(store.create_at("device".into(), "BCDF-GHJK".into(), now, DEVICE_CODE_TTL));
+        assert!(store.pending_exists_at("BCDF-GHJK", now));
         assert!(!store.create_at(
             "other-device".into(),
             "BCDF-GHJK".into(),
@@ -272,6 +406,7 @@ mod tests {
 
         assert_eq!(store.poll_at("device", now), DevicePoll::Pending);
         assert!(store.approve("BCDF-GHJK", identity()));
+        assert!(!store.pending_exists_at("BCDF-GHJK", now));
         assert_eq!(
             store.poll_at("device", now + INITIAL_POLL_INTERVAL),
             DevicePoll::Approved(identity())
@@ -346,6 +481,72 @@ mod tests {
             ));
         }
         assert!(!store.create_at("overflow".into(), "OVER-FLOW".into(), now, DEVICE_CODE_TTL,));
+    }
+
+    #[test]
+    fn oidc_states_are_single_use_and_expire() {
+        let store = OidcStateStore::new();
+        let now = Instant::now();
+        assert!(store.insert_at(
+            "state".into(),
+            "BCDF-GHJK".into(),
+            "verifier".into(),
+            idp(),
+            "https://gateway.example/device/callback".into(),
+            now,
+            OIDC_STATE_TTL,
+        ));
+        assert!(store.insert_at(
+            "replacement".into(),
+            "BCDF-GHJK".into(),
+            "new-verifier".into(),
+            idp(),
+            "https://gateway.example/device/callback".into(),
+            now,
+            OIDC_STATE_TTL,
+        ));
+        assert!(store.take_at("state", now).is_none());
+        let pending = store
+            .take_at("replacement", now)
+            .expect("replacement state exists");
+        assert_eq!(pending.verifier, "new-verifier");
+
+        assert!(store.insert_at(
+            "expired".into(),
+            "BCDF-GHJL".into(),
+            "verifier".into(),
+            idp(),
+            "https://gateway.example/device/callback".into(),
+            now,
+            Duration::ZERO,
+        ));
+        assert!(store.take_at("expired", now).is_none());
+    }
+
+    #[test]
+    fn oidc_states_reject_admission_at_capacity() {
+        let store = OidcStateStore::new();
+        let now = Instant::now();
+        for index in 0..MAX_OIDC_STATES {
+            assert!(store.insert_at(
+                format!("state-{index}"),
+                format!("CODE-{index}"),
+                format!("verifier-{index}"),
+                idp(),
+                "https://gateway.example/device/callback".into(),
+                now,
+                OIDC_STATE_TTL,
+            ));
+        }
+        assert!(!store.insert_at(
+            "overflow".into(),
+            "OVER-FLOW".into(),
+            "verifier".into(),
+            idp(),
+            "https://gateway.example/device/callback".into(),
+            now,
+            OIDC_STATE_TTL,
+        ));
     }
 
     #[test]
