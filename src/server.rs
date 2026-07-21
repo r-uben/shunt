@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::{
     accounts::AccountPool,
+    activity::ActivityStore,
     admin::{self, AdminAuth, AdminStores},
     auth::inbound::InboundAuth,
     codex_analytics, codex_endpoint,
@@ -38,6 +39,12 @@ pub struct AppState {
     pub gateway_auth: Option<Arc<GatewayAuth>>,
     /// Process-lifetime device grants, IdP states/cache, refresh tokens, and limits.
     pub gateway_stores: Arc<GatewayStores>,
+    /// Process-lifetime, bounded live-activity queue (M13). `None` when
+    /// `[server.admin]` was absent at boot, so no activity state is ever
+    /// allocated for a deployment that never exposes the admin surface;
+    /// hooks reading this field must no-op on `None`. Like `admin_stores`,
+    /// created once and kept across reloads.
+    pub activity: Option<Arc<ActivityStore>>,
     /// The live, hot-swappable runtime state a reload updates. Private so the
     /// only way in is a snapshot method that keeps `config`/`inbound_auth`/
     /// `admin_auth` consistent with it.
@@ -48,6 +55,10 @@ impl AppState {
     /// Build state from a config, owning a fresh shared store. Used by tests and
     /// by callers that do not thread an external [`SharedState`].
     pub fn new(config: Config, http_client: reqwest::Client) -> Result<Self, ConfigError> {
+        // Decided once, from the initial config, mirroring `admin_enabled` in
+        // `build_router`: the activity store must not be allocated at all
+        // when the admin surface is disabled at boot.
+        let admin_enabled = config.server.admin.is_some();
         let runtime = RuntimeState::from_config(config)?;
         let shared: SharedState = Arc::new(arc_swap::ArcSwap::from_pointee(runtime));
         Ok(Self::from_shared(
@@ -56,16 +67,19 @@ impl AppState {
             Arc::new(AccountPool::new()),
             Arc::new(AdminStores::new()),
             Arc::new(GatewayStores::new()),
+            admin_enabled.then(|| Arc::new(ActivityStore::new())),
         ))
     }
 
     /// Snapshot the current runtime state from an existing shared store.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_shared(
         shared: SharedState,
         http_client: reqwest::Client,
         accounts: Arc<AccountPool>,
         admin_stores: Arc<AdminStores>,
         gateway_stores: Arc<GatewayStores>,
+        activity: Option<Arc<ActivityStore>>,
     ) -> Self {
         let current = shared.load();
         Self {
@@ -77,6 +91,7 @@ impl AppState {
             accounts,
             admin_stores,
             gateway_stores,
+            activity,
             shared,
         }
     }
@@ -91,6 +106,7 @@ impl AppState {
             self.accounts.clone(),
             self.admin_stores.clone(),
             self.gateway_stores.clone(),
+            self.activity.clone(),
         )
     }
 }
@@ -116,12 +132,17 @@ pub fn build_router(config: Config) -> Result<(Router, SharedState, AppState), C
     let usage_enabled = config.server.usage.is_some();
     let runtime = RuntimeState::from_config(config)?;
     let shared: SharedState = Arc::new(arc_swap::ArcSwap::from_pointee(runtime));
+    // The activity store (M13) is likewise decided once here: it exists only
+    // when the admin surface exists, since `GET /admin/activity` is its only
+    // consumer, and is otherwise `None` so a deployment without `[server.admin]`
+    // never allocates or touches it.
     let state = AppState::from_shared(
         shared.clone(),
         reqwest::Client::new(),
         Arc::new(AccountPool::new()),
         Arc::new(AdminStores::new()),
         Arc::new(GatewayStores::new()),
+        admin_enabled.then(|| Arc::new(ActivityStore::new())),
     );
 
     // `/` and `/health` stay unauthenticated even when `[server.auth]` is
@@ -217,6 +238,8 @@ async fn health() -> Json<HealthResponse> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -280,5 +303,92 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `Config::default()` with `[server.admin]` bound to a unique env var, so
+    /// the admin surface (and therefore the activity store, TICKET-A1) is
+    /// enabled at boot.
+    fn config_with_admin_enabled(label: &str) -> (Config, String) {
+        let env = format!(
+            "SHUNT_SERVER_TEST_ADMIN_TOKENS_{}_{label}",
+            std::process::id()
+        );
+        std::env::set_var(&env, "ops:admin-secret");
+        let mut config = Config::default();
+        config.server.admin = Some(crate::config::AdminConfig {
+            header: "x-shunt-admin-token".to_string(),
+            tokens_env: env.clone(),
+            session_ttl_secs: 3600,
+            pending_ttl_secs: 600,
+            oidc: None,
+        });
+        (config, env)
+    }
+
+    #[test]
+    fn no_activity_store_is_allocated_when_admin_is_disabled_at_boot() {
+        let (_router, _shared, state) = build_router(Config::default()).unwrap();
+        assert!(
+            state.activity.is_none(),
+            "activity store must not be allocated without [server.admin]"
+        );
+    }
+
+    #[test]
+    fn activity_store_exists_when_admin_is_enabled_at_boot() {
+        let (config, env) = config_with_admin_enabled("exists");
+        let (_router, _shared, state) = build_router(config).unwrap();
+        std::env::remove_var(&env);
+
+        assert!(
+            state.activity.is_some(),
+            "activity store must be allocated when [server.admin] is present at boot"
+        );
+    }
+
+    #[test]
+    fn reloading_config_preserves_the_same_activity_store() {
+        let (config, env) = config_with_admin_enabled("reload");
+        let (_router, shared, state) = build_router(config).unwrap();
+        let original = state
+            .activity
+            .clone()
+            .expect("activity store present when admin is enabled at boot");
+
+        // Reload from a temp config file that keeps `[server.admin]` enabled
+        // (mirrors `reload::tests::reload_reresolves_inbound_auth`), so this
+        // proves the store survives a *real* hot reload rather than a no-op.
+        let dir = std::env::temp_dir().join(format!(
+            "shunt-server-activity-reload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("shunt.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\ndefault_provider = \"anthropic\"\n\n[server.admin]\ntokens_env = \"{env}\"\n"
+            ),
+        )
+        .unwrap();
+
+        crate::reload::reload(&shared, Some(&path)).expect("reload succeeds");
+        let refreshed = state
+            .refreshed()
+            .activity
+            .clone()
+            .expect("activity store still present after reload");
+
+        std::env::remove_var(&env);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            Arc::ptr_eq(&original, &refreshed),
+            "reload must preserve the same activity store instance"
+        );
     }
 }
