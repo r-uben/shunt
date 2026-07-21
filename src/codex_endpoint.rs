@@ -220,10 +220,19 @@ async fn forward(
     // span records above; only the pool key is namespaced.
     let pool_key = pool_sticky_key(inbound_client.as_deref(), session_id);
 
+    // Track this Codex request in the admin live-activity view when the store
+    // exists. The handle is cloned before `state` moves into the passthrough;
+    // `activity_id` settles the row's terminal outcome below.
+    let activity_store = state.activity.clone();
+    let activity_id = activity_store
+        .as_ref()
+        .map(|store| store.start(crate::activity::ActivityProtocol::Codex, &provider, &model));
+
     // Pass the client's inbound headers through so the passthrough can forward the
     // Codex CLI's own request headers verbatim (swapping only the credential); the
     // shunt client-token header is stripped inside `forward_codex_inbound`.
     let result = responses::forward_codex_inbound(state, route, pool_key, headers, body).await;
+    let header_latency = started_at.elapsed();
     let status = match &result {
         Ok((status, _)) => status.as_u16(),
         Err(error) => error.response.status().as_u16(),
@@ -232,20 +241,68 @@ async fn forward(
         &provider,
         &model,
         status,
-        started_at.elapsed().as_secs_f64() * 1000.0,
+        header_latency.as_secs_f64() * 1000.0,
     );
-    result
-        .map(|(status, response)| {
-            let response = crate::stream_metrics::observe_response(
-                response,
-                crate::stream_metrics::Protocol::Responses,
-                provider,
-                model,
-                started_at,
-            );
-            (status, response)
-        })
-        .map_err(ForwardError::from)
+    match result {
+        Ok((status_code, response)) => {
+            if crate::stream_metrics::is_sse(&response) {
+                // Streaming: the observer records the terminal outcome once the
+                // body is fully consumed or dropped.
+                let finish = match (activity_store, activity_id) {
+                    (Some(store), Some(id)) => Some(crate::stream_metrics::ActivityFinish {
+                        store,
+                        id,
+                        header_latency: Some(header_latency),
+                        status,
+                    }),
+                    _ => None,
+                };
+                let response = crate::stream_metrics::observe_response(
+                    response,
+                    crate::stream_metrics::Protocol::Responses,
+                    provider,
+                    model,
+                    started_at,
+                    finish,
+                );
+                Ok((status_code, response))
+            } else {
+                // Buffered response: settle the activity row now from the status.
+                if let (Some(store), Some(id)) = (&activity_store, activity_id) {
+                    let outcome = if status < 400 {
+                        crate::activity::ActivityState::Completed
+                    } else {
+                        crate::activity::ActivityState::Error
+                    };
+                    store.finish(
+                        id,
+                        outcome,
+                        Some(status),
+                        Some(header_latency),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                Ok((status_code, response))
+            }
+        }
+        Err(error) => {
+            // A gateway/upstream error that never produced a response body.
+            if let (Some(store), Some(id)) = (&activity_store, activity_id) {
+                store.finish(
+                    id,
+                    crate::activity::ActivityState::Error,
+                    Some(status),
+                    Some(header_latency),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            Err(ForwardError::from(error))
+        }
+    }
 }
 
 /// Namespace the account-pool sticky key with the authenticated inbound client so

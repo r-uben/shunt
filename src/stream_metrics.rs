@@ -8,8 +8,9 @@
 
 use std::{
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -19,7 +20,21 @@ use axum::{
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 
+use crate::activity::{ActivityId, ActivityState, ActivityStore};
+
 const MAX_EVENT_BYTES: usize = 256 * 1024;
+
+/// The activity-store handle a streaming response carries so the observer can
+/// record the terminal outcome exactly once, when the body is fully consumed or
+/// dropped. The header-time fields are known before the body is observed and are
+/// captured by the caller; the observer supplies the terminal state, TTFT, and
+/// token counts it derives from the stream itself.
+pub struct ActivityFinish {
+    pub store: Arc<ActivityStore>,
+    pub id: ActivityId,
+    pub header_latency: Option<Duration>,
+    pub status: u16,
+}
 
 /// Client-facing SSE protocol used to interpret terminal and usage events.
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +60,18 @@ impl Outcome {
             Self::ClientDisconnect => "client_disconnect",
         }
     }
+
+    /// Map a stream outcome onto the admin activity view's terminal state. The
+    /// two enums are kept separate so the metrics vocabulary and the operator
+    /// vocabulary can diverge, but the terminal set is intentionally 1:1.
+    fn as_activity_state(self) -> ActivityState {
+        match self {
+            Self::Completed => ActivityState::Completed,
+            Self::ErrorEvent => ActivityState::Error,
+            Self::UpstreamCut => ActivityState::UpstreamCut,
+            Self::ClientDisconnect => ActivityState::ClientDisconnect,
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -61,6 +88,9 @@ struct ObserverState {
     model: String,
     started_at: Instant,
     first_chunk_seen: bool,
+    /// Time to first streamed chunk, captured once and reused for both the
+    /// metric and the activity row's terminal record.
+    ttft: Option<Duration>,
     buffer: Vec<u8>,
     skipping_oversized: bool,
     skip_tail: [u8; 4],
@@ -69,16 +99,26 @@ struct ObserverState {
     error_seen: bool,
     tokens: TokenUsage,
     finished: bool,
+    /// Present when the admin activity view is tracking this request; the
+    /// terminal transition is recorded into it once, in `finish`.
+    activity: Option<ActivityFinish>,
 }
 
 impl ObserverState {
-    fn new(protocol: Protocol, provider: String, model: String, started_at: Instant) -> Self {
+    fn new(
+        protocol: Protocol,
+        provider: String,
+        model: String,
+        started_at: Instant,
+        activity: Option<ActivityFinish>,
+    ) -> Self {
         Self {
             protocol,
             provider,
             model,
             started_at,
             first_chunk_seen: false,
+            ttft: None,
             buffer: Vec::with_capacity(4096),
             skipping_oversized: false,
             skip_tail: [0; 4],
@@ -87,17 +127,16 @@ impl ObserverState {
             error_seen: false,
             tokens: TokenUsage::default(),
             finished: false,
+            activity,
         }
     }
 
     fn observe_chunk(&mut self, chunk: &[u8]) {
         if !self.first_chunk_seen {
             self.first_chunk_seen = true;
-            crate::metrics::record_ttft(
-                &self.provider,
-                &self.model,
-                self.started_at.elapsed().as_secs_f64() * 1000.0,
-            );
+            let ttft = self.started_at.elapsed();
+            self.ttft = Some(ttft);
+            crate::metrics::record_ttft(&self.provider, &self.model, ttft.as_secs_f64() * 1000.0);
         }
         self.push_bytes(chunk);
     }
@@ -179,11 +218,8 @@ impl ObserverState {
             return;
         }
         self.finished = true;
-        crate::metrics::record_stream_outcome(
-            &self.provider,
-            &self.model,
-            self.outcome(natural_end).as_str(),
-        );
+        let outcome = self.outcome(natural_end);
+        crate::metrics::record_stream_outcome(&self.provider, &self.model, outcome.as_str());
         for (kind, count) in [
             ("input", self.tokens.input),
             ("output", self.tokens.output),
@@ -193,6 +229,21 @@ impl ObserverState {
             if let Some(count) = count {
                 crate::metrics::record_stream_tokens(&self.provider, &self.model, kind, count);
             }
+        }
+        // Record the terminal outcome into the admin activity row, if tracked.
+        // Taken by value so this fires at most once; `ActivityStore::finish` is
+        // itself idempotent, but not re-borrowing keeps the single-edge intent
+        // obvious. This is the one active-to-terminal transition for a stream.
+        if let Some(activity) = self.activity.take() {
+            activity.store.finish(
+                activity.id,
+                outcome.as_activity_state(),
+                Some(activity.status),
+                activity.header_latency,
+                self.ttft,
+                self.tokens.input,
+                self.tokens.output,
+            );
         }
     }
 }
@@ -334,6 +385,7 @@ pub fn observe_response(
     provider: String,
     model: String,
     started_at: Instant,
+    activity: Option<ActivityFinish>,
 ) -> Response<Body> {
     if !is_sse(&response) {
         return response;
@@ -341,12 +393,17 @@ pub fn observe_response(
     let (parts, body) = response.into_parts();
     let observed = ObservedStream {
         upstream: body.into_data_stream().boxed(),
-        state: ObserverState::new(protocol, provider, model, started_at),
+        state: ObserverState::new(protocol, provider, model, started_at, activity),
     };
     Response::from_parts(parts, Body::from_stream(observed))
 }
 
-fn is_sse(response: &Response<Body>) -> bool {
+/// Whether a response is a `text/event-stream`, i.e. the streaming path the
+/// observer wraps. Exposed at crate visibility so the proxy can decide up front
+/// whether a request's terminal outcome is recorded by the observer (streaming)
+/// or by the caller directly (a buffered response has no body lifetime to
+/// observe).
+pub(crate) fn is_sse(response: &Response<Body>) -> bool {
     response
         .headers()
         .get(CONTENT_TYPE)

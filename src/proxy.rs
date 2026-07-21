@@ -175,6 +175,22 @@ async fn forward(
     }
     let provider = route.provider.clone();
     let model = route.model.clone();
+    // Track this request in the admin live-activity view when the store exists.
+    // Cheap count_tokens calls are excluded, matching the metrics gate below, so
+    // the operator sees real inference rather than token estimates. The store
+    // handle is cloned before `state` moves into the adapter; `activity_id` is
+    // the handle used to settle the row's terminal outcome.
+    let activity_store = state.activity.clone();
+    let activity_id = activity_store
+        .as_ref()
+        .filter(|_| !is_count_tokens(uri))
+        .map(|store| {
+            store.start(
+                crate::activity::ActivityProtocol::Messages,
+                &provider,
+                &model,
+            )
+        });
     let result = match route.adapter {
         AdapterKind::Anthropic => {
             AnthropicAdapter
@@ -193,34 +209,87 @@ async fn forward(
         }
     };
     let result = result.map_err(ForwardError::from);
-    // Usage metrics count inference calls only, so Anthropic-routed
-    // count_tokens requests are excluded here just like the Responses-routed
-    // ones that early-returned above — cheap token counts would otherwise be
+    // For streaming responses this measures time to response headers, not to
+    // stream completion — the body is forwarded without buffering.
+    let header_latency = started_at.elapsed();
+    let status = match &result {
+        Ok((status, _)) => status.as_u16(),
+        Err(error) => error.response.status().as_u16(),
+    };
+    // Usage metrics count inference calls only, so Anthropic-routed count_tokens
+    // requests are excluded here just like the Responses-routed ones that
+    // early-returned above — cheap token counts would otherwise be
     // indistinguishable from real inference in the request/latency series.
     if !is_count_tokens(uri) {
-        // For streaming responses this measures time to response headers, not
-        // to stream completion — the body is forwarded without buffering.
-        let status = match &result {
-            Ok((status, _)) => status.as_u16(),
-            Err(error) => error.response.status().as_u16(),
-        };
         crate::metrics::record_proxied_request(
             &provider,
             &model,
             status,
-            started_at.elapsed().as_secs_f64() * 1000.0,
+            header_latency.as_secs_f64() * 1000.0,
         );
     }
-    result.map(|(status, response)| {
-        let response = crate::stream_metrics::observe_response(
-            response,
-            crate::stream_metrics::Protocol::Anthropic,
-            provider,
-            model,
-            started_at,
-        );
-        (status, response)
-    })
+    match result {
+        Ok((status_code, response)) => {
+            if crate::stream_metrics::is_sse(&response) {
+                // Streaming: the observer records the terminal outcome once the
+                // body is fully consumed or dropped (completed / upstream cut /
+                // client disconnect), so it is not settled here.
+                let finish = match (activity_store, activity_id) {
+                    (Some(store), Some(id)) => Some(crate::stream_metrics::ActivityFinish {
+                        store,
+                        id,
+                        header_latency: Some(header_latency),
+                        status,
+                    }),
+                    _ => None,
+                };
+                let response = crate::stream_metrics::observe_response(
+                    response,
+                    crate::stream_metrics::Protocol::Anthropic,
+                    provider,
+                    model,
+                    started_at,
+                    finish,
+                );
+                Ok((status_code, response))
+            } else {
+                // Buffered response: no stream lifetime to observe, so settle the
+                // activity row now from the response status.
+                if let (Some(store), Some(id)) = (&activity_store, activity_id) {
+                    let outcome = if status < 400 {
+                        crate::activity::ActivityState::Completed
+                    } else {
+                        crate::activity::ActivityState::Error
+                    };
+                    store.finish(
+                        id,
+                        outcome,
+                        Some(status),
+                        Some(header_latency),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                Ok((status_code, response))
+            }
+        }
+        Err(error) => {
+            // A gateway/upstream error that never produced a response body.
+            if let (Some(store), Some(id)) = (&activity_store, activity_id) {
+                store.finish(
+                    id,
+                    crate::activity::ActivityState::Error,
+                    Some(status),
+                    Some(header_latency),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 fn enforce_managed_model_policy(
