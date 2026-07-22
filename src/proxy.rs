@@ -155,7 +155,11 @@ async fn forward(
     // translate it into — and bill it as — a full inference call.
     // Anthropic-routed models still pass through to the upstream count_tokens
     // endpoint below.
-    if is_count_tokens(uri) && matches!(route.adapter, AdapterKind::Responses | AdapterKind::Cursor)
+    if is_count_tokens(uri)
+        && matches!(
+            route.adapter,
+            AdapterKind::Responses | AdapterKind::Cursor | AdapterKind::Gemini
+        )
     {
         let mode = state
             .config
@@ -188,6 +192,16 @@ async fn forward(
         }
         AdapterKind::Cursor => {
             CursorAdapter
+                .forward(state, route, uri, headers, body)
+                .await
+        }
+        AdapterKind::Gemini => {
+            crate::adapters::gemini::GeminiAdapter
+                .forward(state, route, uri, headers, body)
+                .await
+        }
+        AdapterKind::Antigravity => {
+            crate::adapters::antigravity::AntigravityAdapter
                 .forward(state, route, uri, headers, body)
                 .await
         }

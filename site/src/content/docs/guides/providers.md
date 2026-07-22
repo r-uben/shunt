@@ -3,11 +3,13 @@ title: Providers
 description: The built-in providers and how to add any Anthropic-compatible backend with a TOML table.
 ---
 
-Providers are a **name → config map**: a new upstream is just another `[providers.<name>]` table — no code change. Three adapter kinds cover everything:
+Providers are a **name → config map**. Anthropic-compatible and Responses-compatible upstreams can be added with configuration; provider-specific transports use native adapters:
 
 - **`kind = "anthropic"`** — the upstream speaks the Anthropic Messages API. shunt passes the request through, optionally injecting a different API key.
 - **`kind = "responses"`** — the upstream speaks the OpenAI Responses API. shunt translates Anthropic Messages ⇄ Responses, including streaming.
-- **`kind = "cursor"`** — the native Cursor adapter. shunt bridges Cursor's ConnectRPC/protobuf AgentService to the Anthropic Messages API — streaming, reasoning in streaming responses, native tool calls, and inline images included. Used by the built-in `cursor` provider.
+- **`kind = "cursor"`** — the native Cursor ConnectRPC/protobuf adapter.
+- **`kind = "gemini"`** — the native Google Code Assist `generateContent` adapter.
+- **`kind = "antigravity"`** — invokes the local Antigravity `agy` CLI.
 
 ## Built-in providers
 
@@ -19,6 +21,40 @@ Providers are a **name → config map**: a new upstream is just another `[provid
 | `xai` | `responses` | `api_key` (`XAI_API_KEY`) | `api.x.ai/v1` — the developer API, billed per token |
 | `grok` | `responses` | `xai_oauth` | `cli-chat-proxy.grok.com/v1` — the Grok CLI proxy; reuses `~/.shunt/xai-auth.json` |
 | `cursor` | `cursor` | `cursor_oauth` | `api2.cursor.sh` — reuses `~/.shunt/cursor-auth.json` (`shunt login cursor`) |
+| `gemini` | `gemini` | `google_oauth` | `cloudcode-pa.googleapis.com` — reuses `~/.gemini/oauth_creds.json` |
+| `antigravity` | `antigravity` | `none` | local `agy` CLI — uses its authenticated Google Antigravity backend |
+
+### Gemini providers
+
+The built-in `gemini` provider translates Anthropic Messages requests to Google Code Assist and reuses the Gemini CLI OAuth file at `~/.gemini/oauth_creds.json`. Authenticate with the Gemini CLI first, then add explicit discovery and routing entries. shunt uses an unexpired access token directly; if shunt itself must refresh it, set `SHUNT_GOOGLE_CLIENT_ID` and `SHUNT_GOOGLE_CLIENT_SECRET`, or rerun `gemini login` so the CLI refreshes the shared file.
+
+```toml
+[[models]]
+id = "claude-gemini-2.5-flash-via-gemini"
+display_name = "[GEM ] Gemini-2.5-Flash"
+
+[[routes]]
+model = "claude-gemini-2.5-flash-via-gemini"
+provider = "gemini"
+upstream_model = "gemini-2.5-flash"
+```
+
+Code Assist also recognizes preview slugs such as `gemini-3.1-pro-preview` and `gemini-3-flash-preview`, subject to account entitlement and provider capacity. It does not accept the Antigravity-only `gemini-3.5-flash` and `gemini-3.6-flash` slugs.
+
+The separate `antigravity` provider invokes an installed and authenticated `agy` binary. Map each local alias to the exact `agy --model` slug:
+
+```toml
+[[models]]
+id = "claude-gemini-3.6-flash-via-antigravity"
+display_name = "[AGY ] Gemini-3.6-Flash"
+
+[[routes]]
+model = "claude-gemini-3.6-flash-via-antigravity"
+provider = "antigravity"
+upstream_model = "gemini-3.6-flash"
+```
+
+The Antigravity path runs one CLI subprocess per request. Its current streaming response is emitted only after `agy` finishes, and token usage is estimated rather than reported by Google. The configured upstream slug proves which model shunt asks `agy` to run; it does not independently attest Google's internal serving identity.
 
 ### The codex provider (ChatGPT subscription)
 
