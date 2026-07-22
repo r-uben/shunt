@@ -1,9 +1,11 @@
+use std::io::{ErrorKind, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use shunt::{
+    blueprints::{self, AddKind},
     config::{Config, OtelConfig, SentryConfig},
     server,
     telemetry::{self, OtelReloadLayer, TelemetryGuard},
@@ -56,6 +58,18 @@ enum Command {
     /// `CLAUDE_CODE_OAUTH_TOKEN`; otherwise auto-refresh mode reads and refreshes
     /// `~/.claude/.credentials.json`.
     Token,
+    /// Retrieve an embedded implementation blueprint for a coding agent.
+    Add {
+        /// Blueprint category (`upstream` or `provider`).
+        #[arg(value_enum)]
+        kind: Option<AddKind>,
+        /// Known blueprint slug or an absolute http(s) research URL.
+        #[arg(requires = "kind")]
+        name_or_url: Option<String>,
+        /// Print raw Markdown for piping to an agent.
+        #[arg(long, requires = "name_or_url")]
+        print: bool,
+    },
     /// Log in to a subscription provider and save its credential for shunt to
     /// inject. Supports `xai`, `cursor`, `claude`, and `codex`.
     Login {
@@ -89,6 +103,11 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Run { config }) => run(config.or(cli.config)),
         Some(Command::Check { config }) => check(config.or(cli.config)),
         Some(Command::Token) => runtime()?.block_on(token()),
+        Some(Command::Add {
+            kind,
+            name_or_url,
+            print,
+        }) => add(kind, name_or_url.as_deref(), print),
         Some(Command::Login {
             provider,
             name,
@@ -105,6 +124,47 @@ fn main() -> anyhow::Result<()> {
         ),
         None if cli.check => check(cli.config),
         None => run(cli.config),
+    }
+}
+
+fn add(kind: Option<AddKind>, name_or_url: Option<&str>, print: bool) -> anyhow::Result<()> {
+    let output = match (kind, name_or_url) {
+        (None, None) => blueprints::list(),
+        (Some(kind), None) => blueprints::list_kind(kind),
+        (Some(kind), Some(name_or_url)) => blueprints::resolve(kind, name_or_url)?,
+        (None, Some(_)) => unreachable!("clap requires kind before name_or_url"),
+    };
+    let stdout = std::io::stdout();
+    write_add_output(stdout.lock(), output.as_bytes())?;
+
+    if let (Some(kind), Some(_)) = (kind, name_or_url) {
+        if let Some(hint) = add_hint(kind, print, std::io::stderr().is_terminal()) {
+            eprintln!("{hint}");
+        }
+    }
+    Ok(())
+}
+
+fn add_hint(kind: AddKind, print: bool, is_tty: bool) -> Option<&'static str> {
+    if print || !is_tty {
+        return None;
+    }
+
+    Some(match kind {
+        AddKind::Upstream => {
+            "Hint: pipe this blueprint to an agent, for example: `shunt add upstream kimi --print | claude`"
+        }
+        AddKind::Provider => {
+            "Hint: pipe this blueprint to an agent, for example: `shunt add provider https://example.com/docs --print | claude`"
+        }
+    })
+}
+
+fn write_add_output(mut writer: impl Write, output: &[u8]) -> std::io::Result<()> {
+    let result = writer.write_all(output).and_then(|()| writer.flush());
+    match result {
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
+        result => result,
     }
 }
 
@@ -470,7 +530,93 @@ fn init_telemetry(config: Option<&OtelConfig>) -> Option<TelemetryGuard> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
+
+    struct FailingWriter(ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn add_hint_is_emitted_for_each_kind_on_a_tty_without_print() {
+        let upstream = add_hint(AddKind::Upstream, false, true).unwrap();
+        assert!(upstream.contains("shunt add upstream kimi --print | claude"));
+
+        let provider = add_hint(AddKind::Provider, false, true).unwrap();
+        assert!(provider.contains("shunt add provider https://example.com/docs --print | claude"));
+    }
+
+    #[test]
+    fn add_hint_is_suppressed_for_print_or_non_tty_stderr() {
+        for kind in [AddKind::Upstream, AddKind::Provider] {
+            assert!(add_hint(kind, true, true).is_none());
+            assert!(add_hint(kind, false, false).is_none());
+            assert!(add_hint(kind, true, false).is_none());
+        }
+    }
+
+    #[test]
+    fn add_output_treats_broken_pipe_as_success() {
+        assert!(write_add_output(FailingWriter(ErrorKind::BrokenPipe), b"blueprint").is_ok());
+    }
+
+    #[test]
+    fn add_output_propagates_other_write_errors() {
+        let error =
+            write_add_output(FailingWriter(ErrorKind::WriteZero), b"blueprint").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn add_command_parses_listing_forms() {
+        let parsed = Cli::try_parse_from(["shunt", "add"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Add {
+                kind: None,
+                name_or_url: None,
+                print: false
+            })
+        ));
+
+        let parsed = Cli::try_parse_from(["shunt", "add", "upstream"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Add {
+                kind: Some(AddKind::Upstream),
+                name_or_url: None,
+                print: false
+            })
+        ));
+    }
+
+    #[test]
+    fn add_command_parses_retrieval_with_print() {
+        let parsed = Cli::try_parse_from(["shunt", "add", "upstream", "kimi", "--print"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Add {
+                kind: Some(AddKind::Upstream),
+                name_or_url: Some(ref value),
+                print: true
+            }) if value == "kimi"
+        ));
+    }
+
+    #[test]
+    fn add_command_rejects_name_without_kind() {
+        assert!(Cli::try_parse_from(["shunt", "add", "kimi"]).is_err());
+        assert!(Cli::try_parse_from(["shunt", "add", "--print"]).is_err());
+    }
 
     #[test]
     fn manual_flag_without_flag_is_always_valid() {
