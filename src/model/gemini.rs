@@ -505,6 +505,7 @@ pub fn map_gemini_error(status: StatusCode, body: &str) -> AdapterError {
     AdapterError {
         message,
         response: Box::new((status, axum::Json(error_body)).into_response()),
+        failure: Some(crate::adapters::AdapterFailure::UpstreamStatus(status)),
     }
 }
 

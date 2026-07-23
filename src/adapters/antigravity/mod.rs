@@ -33,6 +33,7 @@ impl Adapter for AntigravityAdapter {
             let request: Value = serde_json::from_slice(&body).map_err(|err| AdapterError {
                 message: format!("invalid JSON in request: {err}"),
                 response: Box::new(StatusCode::BAD_REQUEST.into_response()),
+                failure: None,
             })?;
 
             let prompt = extract_antigravity_prompt(&request);
@@ -44,6 +45,7 @@ impl Adapter for AntigravityAdapter {
             let agy_bin = find_agy_binary().ok_or_else(|| AdapterError {
                 message: "Antigravity CLI (agy) binary not found. Please install agy or set AGY_BIN environment variable.".to_string(),
                 response: Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+                failure: None,
             })?;
 
             let mut cmd = tokio::process::Command::new(&agy_bin);
@@ -59,6 +61,7 @@ impl Adapter for AntigravityAdapter {
             let output = cmd.output().await.map_err(|err| AdapterError {
                 message: format!("failed to execute agy CLI: {err}"),
                 response: Box::new(StatusCode::BAD_GATEWAY.into_response()),
+                failure: None,
             })?;
 
             if !output.status.success() {
@@ -66,6 +69,7 @@ impl Adapter for AntigravityAdapter {
                 return Err(AdapterError {
                     message: format!("agy CLI execution failed: {err_msg}"),
                     response: Box::new(StatusCode::BAD_GATEWAY.into_response()),
+                    failure: None,
                 });
             }
 
@@ -81,6 +85,7 @@ impl Adapter for AntigravityAdapter {
                     .map_err(|err| AdapterError {
                         message: format!("failed to build SSE response: {err}"),
                         response: Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                        failure: None,
                     })?;
                 Ok((StatusCode::OK, response))
             } else {

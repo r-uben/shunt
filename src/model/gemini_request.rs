@@ -1,9 +1,20 @@
 //! Anthropic Messages -> Gemini generateContent request translation.
 
+use axum::response::IntoResponse;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
 use crate::adapters::AdapterError;
+
+const MAX_SCHEMA_DEPTH: usize = 64;
+
+fn bad_request(message: impl Into<String>) -> AdapterError {
+    AdapterError {
+        message: message.into(),
+        response: Box::new(axum::http::StatusCode::BAD_REQUEST.into_response()),
+        failure: None,
+    }
+}
 
 /// Translate an Anthropic Messages request into a Gemini `generateContent` request body.
 ///
@@ -31,7 +42,7 @@ pub fn translate_request(request: &Value) -> Result<Value, AdapterError> {
     }
 
     // 4. Tools & Tool Choice
-    if let Some(tools) = translate_tools(request) {
+    if let Some(tools) = translate_tools(request)? {
         out.insert("tools".to_string(), tools);
     }
     if let Some(tool_config) = translate_tool_config(request) {
@@ -115,9 +126,11 @@ fn translate_messages(request: &Value) -> Result<Vec<Value>, AdapterError> {
                                 }
                             }
                             "image" => {
-                                if let Some(source) = block.get("source") {
-                                    if source.get("type").and_then(Value::as_str) == Some("base64")
-                                    {
+                                let source = block
+                                    .get("source")
+                                    .ok_or_else(|| bad_request("image block is missing source"))?;
+                                match source.get("type").and_then(Value::as_str) {
+                                    Some("base64") => {
                                         let media_type = source
                                             .get("media_type")
                                             .and_then(Value::as_str)
@@ -125,15 +138,26 @@ fn translate_messages(request: &Value) -> Result<Vec<Value>, AdapterError> {
                                         let data = source
                                             .get("data")
                                             .and_then(Value::as_str)
-                                            .unwrap_or("");
-                                        if !data.is_empty() {
-                                            parts.push(json!({
-                                                "inlineData": {
-                                                    "mimeType": media_type,
-                                                    "data": data
-                                                }
-                                            }));
-                                        }
+                                            .filter(|data| !data.is_empty())
+                                            .ok_or_else(|| {
+                                                bad_request("base64 image source is missing data")
+                                            })?;
+                                        parts.push(json!({
+                                            "inlineData": {
+                                                "mimeType": media_type,
+                                                "data": data
+                                            }
+                                        }));
+                                    }
+                                    Some("url") => {
+                                        return Err(bad_request(
+                                            "URL image sources are not supported by the Gemini adapter",
+                                        ));
+                                    }
+                                    _ => {
+                                        return Err(bad_request(
+                                            "unsupported image source type for Gemini",
+                                        ));
                                     }
                                 }
                             }
@@ -162,13 +186,16 @@ fn translate_messages(request: &Value) -> Result<Vec<Value>, AdapterError> {
                                     .get(tool_use_id)
                                     .map(String::as_str)
                                     .unwrap_or("unknown_tool");
-                                let output_val = extract_tool_result_content(block);
+                                let output_val = extract_tool_result_content(block)?;
+                                let mut response = Map::new();
+                                response.insert("output".to_string(), output_val);
+                                if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+                                    response.insert("error".to_string(), Value::Bool(true));
+                                }
                                 parts.push(json!({
                                     "functionResponse": {
                                         "name": name,
-                                        "response": {
-                                            "output": output_val
-                                        }
+                                        "response": response
                                     }
                                 }));
                             }
@@ -191,30 +218,35 @@ fn translate_messages(request: &Value) -> Result<Vec<Value>, AdapterError> {
     Ok(contents)
 }
 
-fn extract_tool_result_content(block: &Value) -> Value {
-    if let Some(content) = block.get("content") {
+fn extract_tool_result_content(block: &Value) -> Result<Value, AdapterError> {
+    let output = if let Some(content) = block.get("content") {
         match content {
             Value::String(text) => json!(text),
             Value::Array(blocks) => {
                 let mut text_parts = Vec::new();
-                for b in blocks {
-                    if b.get("type").and_then(Value::as_str) == Some("text") {
-                        if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            text_parts.push(t);
+                for block in blocks {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                text_parts.push(text);
+                            }
                         }
+                        Some("image") | Some("document") => {
+                            return Err(bad_request(
+                                "rich media tool results are not supported by the Gemini adapter",
+                            ));
+                        }
+                        _ => {}
                     }
                 }
-                if !text_parts.is_empty() {
-                    json!(text_parts.join("\n"))
-                } else {
-                    content.clone()
-                }
+                json!(text_parts.join("\n"))
             }
             _ => content.clone(),
         }
     } else {
         json!("")
-    }
+    };
+    Ok(output)
 }
 
 fn translate_generation_config(request: &Value) -> Map<String, Value> {
@@ -242,40 +274,54 @@ fn translate_generation_config(request: &Value) -> Map<String, Value> {
     config
 }
 
-fn sanitize_gemini_schema(val: &mut Value) {
-    match val {
+fn sanitize_gemini_schema(value: &mut Value, depth: usize) -> Result<(), AdapterError> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(bad_request(
+            "tool input schema exceeds maximum nesting depth",
+        ));
+    }
+    match value {
         Value::Object(map) => {
-            map.remove("$schema");
-            map.remove("propertyNames");
-            map.remove("$id");
-            map.remove("$comment");
-            map.remove("patternProperties");
-            map.remove("exclusiveMinimum");
-            map.remove("exclusiveMaximum");
-            map.remove("const");
-            for (_k, v) in map.iter_mut() {
-                sanitize_gemini_schema(v);
+            for key in [
+                "$schema",
+                "propertyNames",
+                "$id",
+                "$comment",
+                "patternProperties",
+                "exclusiveMinimum",
+                "exclusiveMaximum",
+                "const",
+            ] {
+                map.remove(key);
+            }
+            for child in map.values_mut() {
+                sanitize_gemini_schema(child, depth + 1)?;
             }
         }
-        Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                sanitize_gemini_schema(v);
+        Value::Array(array) => {
+            for child in array {
+                sanitize_gemini_schema(child, depth + 1)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
-fn translate_tools(request: &Value) -> Option<Value> {
-    let tools = request.get("tools")?.as_array()?;
+fn translate_tools(request: &Value) -> Result<Option<Value>, AdapterError> {
+    let Some(tools) = request.get("tools").and_then(Value::as_array) else {
+        return Ok(None);
+    };
     if tools.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut function_declarations = Vec::new();
 
     for tool in tools {
-        let name = tool.get("name")?.as_str()?;
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
         let description = tool
             .get("description")
             .and_then(Value::as_str)
@@ -284,7 +330,7 @@ fn translate_tools(request: &Value) -> Option<Value> {
             .get("input_schema")
             .cloned()
             .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
-        sanitize_gemini_schema(&mut parameters);
+        sanitize_gemini_schema(&mut parameters, 0)?;
 
         function_declarations.push(json!({
             "name": name,
@@ -294,11 +340,11 @@ fn translate_tools(request: &Value) -> Option<Value> {
     }
 
     if function_declarations.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(json!([{
+        Ok(Some(json!([{
             "functionDeclarations": function_declarations
-        }]))
+        }])))
     }
 }
 
@@ -470,6 +516,73 @@ mod tests {
         let params = &result["tools"][0]["functionDeclarations"][0]["parameters"];
         assert!(params.get("$schema").is_none());
         assert!(params["properties"]["arg1"].get("propertyNames").is_none());
+    }
+
+    #[test]
+    fn rejects_url_images_instead_of_dropping_them() {
+        let input = json!({
+            "messages": [{"role": "user", "content": [{
+                "type": "image",
+                "source": {"type": "url", "url": "https://example.com/image.png"}
+            }]}]
+        });
+
+        let error = translate_request(&input).unwrap_err();
+        assert!(error.message.contains("URL image sources"));
+    }
+
+    #[test]
+    fn preserves_tool_failure_signal() {
+        let input = json!({
+            "messages": [
+                {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "toolu_1",
+                    "is_error": true, "content": "not found"
+                }]}
+            ]
+        });
+
+        let result = translate_request(&input).unwrap();
+        let response = &result["contents"][1]["parts"][0]["functionResponse"]["response"];
+        assert_eq!(response["error"], true);
+        assert_eq!(response["output"], "not found");
+    }
+
+    #[test]
+    fn rejects_rich_media_tool_results() {
+        let input = json!({
+            "messages": [
+                {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "toolu_1", "name": "inspect", "input": {}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "toolu_1", "content": [{
+                        "type": "image", "source": {"type": "base64", "data": "AA=="}
+                    }]
+                }]}
+            ]
+        });
+
+        let error = translate_request(&input).unwrap_err();
+        assert!(error.message.contains("rich media tool results"));
+    }
+
+    #[test]
+    fn rejects_excessively_nested_tool_schema() {
+        let mut nested = json!({"type": "string"});
+        for _ in 0..=MAX_SCHEMA_DEPTH {
+            nested = json!({"items": nested});
+        }
+        let input = json!({
+            "messages": [{"role": "user", "content": "run"}],
+            "tools": [{"name": "deep", "input_schema": nested}]
+        });
+
+        let error = translate_request(&input).unwrap_err();
+        assert!(error.message.contains("maximum nesting depth"));
     }
 
     #[test]
