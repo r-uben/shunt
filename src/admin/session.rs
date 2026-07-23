@@ -51,23 +51,41 @@ impl ObservedUsageCache {
     }
 
     pub fn claude(&self, access_token: &str) -> Option<crate::accounts::UsageSnapshot> {
+        self.claude_at(access_token, Instant::now())
+    }
+
+    pub fn claude_at(
+        &self,
+        access_token: &str,
+        now: Instant,
+    ) -> Option<crate::accounts::UsageSnapshot> {
         let token_hash: [u8; 32] = Sha256::digest(access_token.as_bytes()).into();
         self.claude
             .lock()
             .expect("observed usage cache lock poisoned")
             .as_ref()
             .filter(|cached| {
-                cached.token_hash == token_hash && cached.observed_at.elapsed() < OBSERVED_USAGE_TTL
+                cached.token_hash == token_hash
+                    && now.duration_since(cached.observed_at) < OBSERVED_USAGE_TTL
             })
             .map(|cached| cached.snapshot.clone())
     }
 
     pub fn store_claude(&self, access_token: &str, snapshot: crate::accounts::UsageSnapshot) {
+        self.store_claude_at(access_token, snapshot, Instant::now());
+    }
+
+    pub fn store_claude_at(
+        &self,
+        access_token: &str,
+        snapshot: crate::accounts::UsageSnapshot,
+        now: Instant,
+    ) {
         *self
             .claude
             .lock()
             .expect("observed usage cache lock poisoned") = Some(CachedObservedUsage {
-            observed_at: Instant::now(),
+            observed_at: now,
             token_hash: Sha256::digest(access_token.as_bytes()).into(),
             snapshot,
         });
@@ -523,10 +541,31 @@ mod tests {
             }),
             ..Default::default()
         };
-        cache.store_claude("account-a-token", snapshot.clone());
+        let now = Instant::now();
+        cache.store_claude_at("account-a-token", snapshot.clone(), now);
 
-        assert_eq!(cache.claude("account-a-token"), Some(snapshot));
-        assert_eq!(cache.claude("account-b-token"), None);
+        assert_eq!(cache.claude_at("account-a-token", now), Some(snapshot));
+        assert_eq!(cache.claude_at("account-b-token", now), None);
+    }
+
+    #[test]
+    fn observed_usage_cache_expires_after_ttl() {
+        let cache = ObservedUsageCache::new();
+        let snapshot = crate::accounts::UsageSnapshot::default();
+        let stored_at = Instant::now();
+        cache.store_claude_at("token", snapshot.clone(), stored_at);
+
+        assert_eq!(
+            cache.claude_at(
+                "token",
+                stored_at + OBSERVED_USAGE_TTL - Duration::from_secs(1)
+            ),
+            Some(snapshot.clone())
+        );
+        assert_eq!(
+            cache.claude_at("token", stored_at + OBSERVED_USAGE_TTL),
+            None
+        );
     }
 
     #[test]

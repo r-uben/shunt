@@ -25,6 +25,46 @@ const GROK_CLIENT_MODE: &str = "cli";
 const ANTIGRAVITY_STATUS_PATH: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
 const OBSERVATION_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+fn cursor_app_state_db_path(home: &std::path::Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        home.join("AppData")
+            .join("Roaming")
+            .join("Cursor")
+            .join("User")
+            .join("globalStorage")
+            .join("state.vscdb")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library")
+            .join("Application Support")
+            .join("Cursor")
+            .join("User")
+            .join("globalStorage")
+            .join("state.vscdb")
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        home.join(".config")
+            .join("Cursor")
+            .join("User")
+            .join("globalStorage")
+            .join("state.vscdb")
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct QuotaBucket {
     pub(crate) label: String,
@@ -276,53 +316,61 @@ struct AntigravityConnection {
 }
 
 fn discover_antigravity_connection() -> Result<AntigravityConnection, String> {
-    use std::process::Command;
-
-    let processes = Command::new("ps")
-        .args(["-ax", "-o", "pid=,command="])
-        .output()
-        .map_err(|error| format!("could not inspect Antigravity processes: {error}"))?;
-    let processes = String::from_utf8_lossy(&processes.stdout);
-    let line = processes
-        .lines()
-        .find(|line| {
-            line.contains("/Applications/Antigravity.app/Contents/Resources/bin/language_server")
-                && line.contains("--csrf_token")
-        })
-        .ok_or_else(|| "Antigravity is not running".to_string())?;
-    let mut words = line.split_whitespace();
-    let pid = words
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())
-        .ok_or_else(|| "could not identify Antigravity language server".to_string())?;
-    let words = words.collect::<Vec<_>>();
-    let csrf_token = words
-        .windows(2)
-        .find(|window| window[0] == "--csrf_token")
-        .map(|window| window[1].to_string())
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| "Antigravity language server has no CSRF token".to_string())?;
-
-    let listeners = Command::new("lsof")
-        .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"])
-        .output()
-        .map_err(|error| format!("could not inspect Antigravity listeners: {error}"))?;
-    let listeners = String::from_utf8_lossy(&listeners.stdout);
-    let mut ports = listeners
-        .lines()
-        .filter_map(|line| {
-            line.split_whitespace()
-                .find(|part| part.contains("127.0.0.1:"))
-        })
-        .filter_map(|address| address.rsplit(':').next())
-        .filter_map(|port| port.parse::<u16>().ok())
-        .collect::<Vec<_>>();
-    ports.sort_unstable();
-    ports.dedup();
-    if ports.is_empty() {
-        return Err("Antigravity language server has no loopback listener".to_string());
+    #[cfg(not(unix))]
+    {
+        return Err("Antigravity local discovery is only supported on Unix".to_string());
     }
-    Ok(AntigravityConnection { ports, csrf_token })
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+
+        let processes = Command::new("ps")
+            .args(["-ax", "-o", "pid=,command="])
+            .output()
+            .map_err(|error| format!("could not inspect Antigravity processes: {error}"))?;
+        let processes = String::from_utf8_lossy(&processes.stdout);
+        let line = processes
+            .lines()
+            .find(|line| {
+                line.contains(
+                    "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
+                ) && line.contains("--csrf_token")
+            })
+            .ok_or_else(|| "Antigravity is not running".to_string())?;
+        let mut words = line.split_whitespace();
+        let pid = words
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| "could not identify Antigravity language server".to_string())?;
+        let words = words.collect::<Vec<_>>();
+        let csrf_token = words
+            .windows(2)
+            .find(|window| window[0] == "--csrf_token")
+            .map(|window| window[1].to_string())
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| "Antigravity language server has no CSRF token".to_string())?;
+
+        let listeners = Command::new("lsof")
+            .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"])
+            .output()
+            .map_err(|error| format!("could not inspect Antigravity listeners: {error}"))?;
+        let listeners = String::from_utf8_lossy(&listeners.stdout);
+        let mut ports = listeners
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace()
+                    .find(|part| part.contains("127.0.0.1:"))
+            })
+            .filter_map(|address| address.rsplit(':').next())
+            .filter_map(|port| port.parse::<u16>().ok())
+            .collect::<Vec<_>>();
+        ports.sort_unstable();
+        ports.dedup();
+        if ports.is_empty() {
+            return Err("Antigravity language server has no loopback listener".to_string());
+        }
+        Ok(AntigravityConnection { ports, csrf_token })
+    }
 }
 
 async fn fetch_antigravity_quota_from(
@@ -596,16 +644,8 @@ struct CursorAppSession {
 }
 
 fn read_cursor_app_session() -> Result<CursorAppSession, String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME is not set".to_string())?;
-    let path = home
-        .join("Library")
-        .join("Application Support")
-        .join("Cursor")
-        .join("User")
-        .join("globalStorage")
-        .join("state.vscdb");
+    let home = user_home().ok_or_else(|| "HOME and USERPROFILE are unset".to_string())?;
+    let path = cursor_app_state_db_path(&home);
     let connection =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| format!("could not open Cursor app state read-only: {error}"))?;
@@ -847,7 +887,7 @@ fn discover_codex() -> Option<ObservedCredential> {
 }
 
 fn discover_grok() -> Option<ObservedCredential> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = user_home()?;
     let value = read_json(&home.join(".grok").join("auth.json"))?;
     parse_grok_cli(&value, SystemTime::now())
 }
@@ -887,7 +927,7 @@ fn parse_grok_cli(value: &Value, now: SystemTime) -> Option<ObservedCredential> 
 }
 
 fn discover_kimi() -> Option<ObservedCredential> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = user_home()?;
     let value = read_json(
         &home
             .join(".kimi-code")
@@ -915,7 +955,7 @@ fn discover_gemini() -> Option<ObservedCredential> {
             account_id: None,
         });
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = user_home()?;
     let value = read_json(&home.join(".gemini").join("oauth_creds.json"))?;
     let mut observed = parse_oauth_provider(
         &value,
@@ -1105,7 +1145,9 @@ fn parse_claude(
     let now_ms = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as i64;
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX);
     let plan = oauth
         .get("subscriptionType")
         .and_then(Value::as_str)

@@ -93,14 +93,14 @@ pub fn setup(explicit_config: Option<&Path>) -> anyhow::Result<SetupOutcome> {
     }
 
     Ok(SetupOutcome {
-        config_path,
+        config_path: config_path.clone(),
         token_file,
         token,
         token_reused,
         admin_block_added: ensured.admin_block_added,
         oauth_usage_block_added: ensured.oauth_usage_block_added,
         admin_already_configured: ensured.admin_already_configured,
-        dashboard_url: dashboard_url(&existing),
+        dashboard_url: dashboard_url(&existing, &config_path),
     })
 }
 
@@ -261,17 +261,28 @@ fn has_uncommented_table(text: &str, dotted: &str) -> bool {
 /// The dashboard URL, using the configured bind when the file parses, else the
 /// documented default. A wildcard bind is shown as loopback since that is where
 /// a local browser reaches it.
-fn dashboard_url(existing: &str) -> String {
-    let bind = toml::from_str::<toml::Value>(existing)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("server")?
-                .get("bind")?
-                .as_str()
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "127.0.0.1:3001".to_string());
+fn dashboard_url(existing: &str, config_path: &Path) -> String {
+    let bind = match ConfigFormat::from_path(config_path) {
+        ConfigFormat::Yaml => serde_yaml::from_str::<serde_yaml::Value>(existing)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("server")?
+                    .get("bind")?
+                    .as_str()
+                    .map(str::to_string)
+            }),
+        ConfigFormat::Toml => toml::from_str::<toml::Value>(existing)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("server")?
+                    .get("bind")?
+                    .as_str()
+                    .map(str::to_string)
+            }),
+    }
+    .unwrap_or_else(|| "127.0.0.1:3001".to_string());
     let host_port = bind
         .replace("0.0.0.0", "127.0.0.1")
         .replace("[::]", "127.0.0.1");
@@ -382,19 +393,34 @@ mod tests {
 
     #[test]
     fn dashboard_url_uses_configured_bind() {
-        let url = dashboard_url("[server]\nbind = \"127.0.0.1:9000\"\n");
+        let url = dashboard_url(
+            "[server]\nbind = \"127.0.0.1:9000\"\n",
+            Path::new("shunt.toml"),
+        );
         assert_eq!(url, "http://127.0.0.1:9000/admin");
     }
 
     #[test]
     fn dashboard_url_maps_wildcard_to_loopback() {
-        let url = dashboard_url("[server]\nbind = \"0.0.0.0:3001\"\n");
+        let url = dashboard_url(
+            "[server]\nbind = \"0.0.0.0:3001\"\n",
+            Path::new("shunt.toml"),
+        );
         assert_eq!(url, "http://127.0.0.1:3001/admin");
     }
 
     #[test]
     fn dashboard_url_falls_back_on_missing_bind() {
-        assert_eq!(dashboard_url(""), "http://127.0.0.1:3001/admin");
+        assert_eq!(
+            dashboard_url("", Path::new("shunt.toml")),
+            "http://127.0.0.1:3001/admin"
+        );
+    }
+
+    #[test]
+    fn dashboard_url_reads_bind_from_yaml_config() {
+        let url = dashboard_url("server:\n  bind: 127.0.0.1:9000\n", Path::new("shunt.yaml"));
+        assert_eq!(url, "http://127.0.0.1:9000/admin");
     }
 
     #[test]
