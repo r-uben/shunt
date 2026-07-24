@@ -1,60 +1,46 @@
-# STATUS — Native Gemini provider (Path B)
+# STATUS — Gemini Code Assist and Antigravity providers
 
-Last updated: 2026-07-22 (See `docs/notes/gemini-provider-capacity-and-models.md`)
+Last updated: 2026-07-22
 
 ## Stage
-Plan authored; S1 auth spike DONE (see `logs/2026-07-21_S1-auth-spike.md`). Backend, wire
-format, and the two target slugs live-verified.
 
-**AUTH DECISION (2026-07-21, amended 2026-07-22): reuse the gemini-cli subscription token.**
-Hard constraint from user: must use the Google One AI Pro subscription at ZERO added cost.
-S1 proved that refresh with the Gemini CLI installed-app credentials works end-to-end
-(→ gemini-3-flash-preview returned SHUNT-OK). Those credentials are not committed:
-shunt uses an unexpired access token directly, while shunt-side refresh requires
-`SHUNT_GOOGLE_CLIENT_ID` and `SHUNT_GOOGLE_CLIENT_SECRET`; rerunning `gemini login` is the
-fallback. Antigravity token can't be refreshed by us (obfuscated secret / Path C); AI Studio
-API key rejected (adds per-token cost).
-- **A1 rewritten** to: read `~/.gemini/oauth_creds.json` (tolerate atomic-rewrite ENOENT),
-  optionally refresh with operator-supplied client credentials, and discover the
-  loadCodeAssist project.
-- **A2 DROPPED** (own-PKCE login is dead — Google refuses new logins on the gemini-cli client).
-- **Known fragility:** Google is sunsetting this client for individuals. Rerun the Gemini CLI
-  login if the shared token expires and no refresh client credentials are configured.
+Implementation is complete on `feat/gemini-provider` and published as commit `6e3cdad`.
 
-External advisory panel (codex/gemini/grok) was not run (agent_ctl blocked by local python hook);
-run `/plan review gemini-provider` if you want the cross-model attack before/while building.
+- Tracking issue: [#233](https://github.com/pleaseai/shunt/issues/233)
+- Pull request: [#234](https://github.com/pleaseai/shunt/pull/234)
+- Socket Security passed; Greptile and Cubic reviews are pending.
+- All implementation tickets for this PR are done. Multi-account pooling remains future work.
 
-## Base state (clean before tickets)
-- Repo: `shunt`. Currently on `feat/214-admin-live-activity` (UNRELATED). **Create `feat/NN-gemini-provider` off a clean `main`** + a tracking issue before TICKET-C1/A1/etc. (S1 is a scratch spike, no branch needed).
-- shunt today: 3 adapter kinds (anthropic/responses/cursor); no Gemini, no Google auth. This plan flips `docs/comparison.md` item I ("native Gemini not in scope").
-- Verified slugs on the account's standard-tier: `gemini-3.1-pro-preview`, `gemini-3-flash-preview` (also `gemini-2.5-pro`/`-flash`). `gemini-3.1-pro`/`3.6-flash`/`3.5-flash` all 404.
+## Verification
 
-## Ticket board
-| Ticket | Stream | Status | depends-on | Wave |
-|--------|--------|--------|------------|------|
-| S1 | De-risk (auth spike) | DONE | — | 1 |
-| C1 | Config foundation | DONE | — | 1 |
-| A1 | Google auth module | DONE | S1, C1 | 2 |
-| B1 | Request translation | DONE | C1 | 2 |
-| B2 | Response/SSE translation | DONE | B1 | 3 |
-| A2 | Own-PKCE login (v2) | DROPPED | A1 | 3 |
-| D1 | Adapter + dispatch | DONE | A1, B2, C1 | 4 |
-| T1 | Integration tests | DONE | D1 | 5 |
-| X1 | Docs (all surfaces) | DONE | D1 | 5 |
-| G1 | Agent layer (the goal) | DONE | D1 | 5 |
-| E1 | Multi-account pool (v2) | TODO | D1 | 5 |
+Observed on 2026-07-22:
 
-## Dispatch waves
-- Wave 1: **S1** (spike, gates auth) ∥ **C1** (config, gates everything) — disjoint.
-- Wave 2: **A1** (auth) ∥ **B1** (request xlate) — disjoint files.
-- Wave 3: **B2** (stream xlate).
-- Wave 4: **D1** (adapter + dispatch).
-- Wave 5: **T1** ∥ **X1** ∥ **G1** ∥ **E1** (v2) — disjoint files.
+- `cargo fmt --all --check` passed.
+- `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- `cargo test --all-features --workspace` passed.
+- `git diff --check` passed.
+- `claude-gemini-3.5-flash-via-antigravity` routed to `agy --model gemini-3.5-flash` and returned HTTP 200 with the expected sentinel.
+- `claude-gemini-3.6-flash-via-antigravity` routed to `agy --model gemini-3.6-flash` and returned HTTP 200 with the expected sentinel.
 
-Critical path to first spawnable Gemini agent: S1 → C1 → A1/B1 → B2 → D1 → G1.
-A2 (own login) was dropped; E1 (multi-account concurrency) is the remaining v2 hardening.
+The Antigravity evidence proves the exact model slug shunt supplies to `agy`; it does not independently attest Google's internal serving identity.
+
+## Recent decisions
+
+- Native Code Assist and Antigravity are separate providers because they use different transports, authentication, model namespaces, and capacity behavior.
+- The native provider reuses `~/.gemini/oauth_creds.json`. A valid access token works directly; shunt-side refresh requires `SHUNT_GOOGLE_CLIENT_ID` and `SHUNT_GOOGLE_CLIENT_SECRET`, otherwise the operator reruns `gemini login`.
+- Google OAuth client credentials are not committed. GitHub blocked the initial unpublished commit through push protection; the commit was amended to remove the credentials instead of bypassing protection.
+- Native Gemini tool-result correlation, non-streaming endpoint selection, terminal SSE closure, thinking-config nesting, and host-independent Antigravity tests were fixed before publication.
+- Multi-account pooling is outside PR #234 and remains future hardening.
+
+## Outstanding TODOs
+
+- Triage and address any actionable findings from PR #234.
+- Rerun the required quality gates after any review-driven changes.
+- Keep unrelated local work out of this PR:
+  - `src/auth/codex/auth.rs`
+  - `docs/plans/live-activity/`
+  - `docs/plans/usage-bars/`
 
 ## Next action
-S1 + C1 done on branch `feat/gemini-provider`. A1 reads the shared Gemini CLI credential
-file and optionally refreshes with operator-supplied client credentials; B1/B2/D1/T1/X1 are
-implemented and verified. E1 (multi-account concurrency) remains future hardening.
+
+Check Greptile and Cubic results on PR #234, triage verified findings, and update the branch only when a finding requires a change.

@@ -1,0 +1,56 @@
+[
+  {
+    "id": "A1",
+    "agent": "codex",
+    "prompt": "Implement TICKET-A1 from docs/plans/live-activity/TICKETS.md exactly as specified. Read AGENTS.md, the plan STATUS/TICKETS files, issue #214, src/server.rs, and related process-lifetime store patterns first. Work only on the listed files. Add focused unit tests. Do not implement later tickets. Run relevant format, clippy, and tests, then report observed results and changed files for an independent reviewer.",
+    "depends_on": [],
+    "status": "pending",
+    "cwd": "/Users/rubenffuertes/repos/open-source/shunt",
+    "outputs": ["src/activity.rs", "src/lib.rs", "src/server.rs"]
+  },
+  {
+    "id": "B1",
+    "agent": "codex",
+    "prompt": "Implement TICKET-B1 from docs/plans/live-activity/TICKETS.md exactly as specified after A1 is reviewed. Reuse stream_metrics' existing SSE classification/parser and preserve byte-for-byte streaming. Cover both Messages and inbound Codex, exact-once completion, cancellation, non-SSE, errors, and count_tokens exclusion. Work only on the listed files and run focused tests plus format/clippy.",
+    "depends_on": ["A1"],
+    "status": "pending",
+    "cwd": "/Users/rubenffuertes/repos/open-source/shunt",
+    "outputs": ["src/proxy.rs", "src/codex_endpoint.rs", "src/stream_metrics.rs", "src/stream_metrics/tests.rs"]
+  },
+  {
+    "id": "C1",
+    "agent": "codex",
+    "prompt": "Implement TICKET-C1 from docs/plans/live-activity/TICKETS.md exactly as specified after B1 is reviewed. Add the focused authenticated admin endpoint and dedicated privacy/security integration tests. Do not add UI or collect any forbidden data. Work only on the listed files and run relevant tests plus format/clippy.",
+    "depends_on": ["B1"],
+    "status": "pending",
+    "cwd": "/Users/rubenffuertes/repos/open-source/shunt",
+    "outputs": ["src/admin/activity.rs", "src/admin/mod.rs", "tests/admin_activity.rs"]
+  },
+  {
+    "id": "C2",
+    "agent": "gemini",
+    "prompt": "Implement TICKET-C2 from docs/plans/live-activity/TICKETS.md exactly as specified after C1 is reviewed. Match the existing no-framework admin HTML/JS idiom, render untrusted values through textContent, provide accessible states, and avoid new dependencies. Work only on src/admin/html.rs and run focused assertions plus format/clippy/tests.",
+    "depends_on": ["C1"],
+    "status": "pending",
+    "cwd": "/Users/rubenffuertes/repos/open-source/shunt",
+    "outputs": ["src/admin/html.rs"]
+  },
+  {
+    "id": "D1",
+    "agent": "claude",
+    "prompt": "Implement TICKET-D1 from docs/plans/live-activity/TICKETS.md after C2 is reviewed. Write the M13 behavior spec and affected user/admin documentation in English, update only the activity claim in docs/comparison.md, do not touch generated wiki/site dist, and build the site. Keep docs in the same feature PR.",
+    "depends_on": ["C2"],
+    "status": "pending",
+    "cwd": "/Users/rubenffuertes/repos/open-source/shunt",
+    "outputs": ["docs/m13-admin-activity-surface.md", "site/src/content/docs/guides/admin-remote-provisioning.md", "docs/comparison.md"]
+  },
+  {
+    "id": "Q1",
+    "agent": "claude",
+    "prompt": "Execute TICKET-Q1 from docs/plans/live-activity/TICKETS.md after D1. Use reviewers independent from implementers for correctness and security/privacy, reconcile only verified in-scope findings, then run all specified Rust and site quality gates and record observed results. Do not commit or push without explicit user approval.",
+    "depends_on": ["D1"],
+    "status": "pending",
+    "cwd": "/Users/rubenffuertes/repos/open-source/shunt",
+    "outputs": []
+  }
+]
