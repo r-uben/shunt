@@ -15,6 +15,7 @@ fn state(protocol: Protocol) -> ObserverState {
         "provider".to_string(),
         "model".to_string(),
         Instant::now(),
+        None,
     )
 }
 
@@ -203,6 +204,7 @@ async fn wrapper_forwards_all_chunks_verbatim_and_preserves_headers() {
         "provider".to_string(),
         "model".to_string(),
         Instant::now(),
+        None,
     );
 
     assert_eq!(wrapped.headers()["x-test"], "kept");
@@ -226,6 +228,7 @@ async fn dropping_body_mid_stream_exercises_client_disconnect_path() {
         "provider".to_string(),
         "model".to_string(),
         Instant::now(),
+        None,
     );
     let mut body_stream = wrapped.into_body().into_data_stream();
     assert_eq!(
@@ -248,10 +251,91 @@ async fn non_sse_body_is_left_untouched() {
         "provider".to_string(),
         "model".to_string(),
         Instant::now(),
+        None,
     );
     assert_eq!(response.headers()["content-length"], "2");
     assert_eq!(
         to_bytes(response.into_body(), usize::MAX).await.unwrap(),
         "{}"
     );
+}
+
+#[tokio::test]
+async fn a_tracked_stream_records_completion_into_the_activity_store() {
+    use std::{sync::Arc, time::Duration};
+
+    use crate::activity::{ActivityProtocol, ActivityState, ActivityStore};
+    use crate::stream_metrics::ActivityFinish;
+
+    let store = Arc::new(ActivityStore::new());
+    let id = store.start(ActivityProtocol::Messages, "provider", "model");
+
+    let chunks = vec![Ok::<_, Infallible>(Bytes::from_static(
+        b"event: message_stop\ndata: {}\n\n",
+    ))];
+    let response = Response::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(stream::iter(chunks)))
+        .unwrap();
+    let wrapped = observe_response(
+        response,
+        Protocol::Anthropic,
+        "provider".to_string(),
+        "model".to_string(),
+        Instant::now(),
+        Some(ActivityFinish {
+            store: store.clone(),
+            id,
+            header_latency: Some(Duration::from_millis(5)),
+            status: 200,
+        }),
+    );
+    // Draining the body to its end drives the observer's terminal transition.
+    let _ = to_bytes(wrapped.into_body(), usize::MAX).await.unwrap();
+
+    let row = store.snapshot().into_iter().find(|r| r.id == id).unwrap();
+    assert_eq!(row.state, ActivityState::Completed);
+    assert_eq!(row.status, Some(200));
+    assert!(row.duration.is_some());
+}
+
+#[tokio::test]
+async fn dropping_a_tracked_stream_records_client_disconnect() {
+    use std::sync::Arc;
+
+    use crate::activity::{ActivityProtocol, ActivityState, ActivityStore};
+    use crate::stream_metrics::ActivityFinish;
+
+    let store = Arc::new(ActivityStore::new());
+    let id = store.start(ActivityProtocol::Messages, "provider", "model");
+
+    // A first frame then a stream that never ends: dropping the body before a
+    // terminal frame is the client-disconnect path.
+    let first = Ok::<_, Infallible>(Bytes::from_static(
+        b"event: content_block_delta\ndata: {}\n\n",
+    ));
+    let upstream = stream::once(async { first }).chain(stream::pending());
+    let response = Response::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(upstream))
+        .unwrap();
+    let wrapped = observe_response(
+        response,
+        Protocol::Anthropic,
+        "provider".to_string(),
+        "model".to_string(),
+        Instant::now(),
+        Some(ActivityFinish {
+            store: store.clone(),
+            id,
+            header_latency: None,
+            status: 200,
+        }),
+    );
+    let mut body_stream = wrapped.into_body().into_data_stream();
+    let _ = body_stream.next().await.unwrap().unwrap();
+    drop(body_stream);
+
+    let row = store.snapshot().into_iter().find(|r| r.id == id).unwrap();
+    assert_eq!(row.state, ActivityState::ClientDisconnect);
 }

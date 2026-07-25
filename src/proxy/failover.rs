@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::{to_bytes, Body},
@@ -7,6 +7,7 @@ use axum::{
 };
 
 use crate::{
+    activity::{ActivityId, ActivityProtocol, ActivityState},
     adapters::{
         anthropic::AnthropicAdapter, cursor::CursorAdapter, responses::ResponsesAdapter, Adapter,
         AdapterError, AdapterFailure,
@@ -16,6 +17,7 @@ use crate::{
     error::{ShuntError, UpstreamError},
     routing::{self, AdapterKind},
     server::AppState,
+    stream_metrics::ActivityFinish,
 };
 
 use super::{
@@ -104,6 +106,17 @@ pub(super) async fn forward(
         let model = route.model.clone();
         let upstream_model = route.upstream_model.clone();
         let attempt_started_at = Instant::now();
+        // One activity row per *attempt*, opened alongside the
+        // `record_proxied_request` call below so the admin view and the metrics
+        // agree on what an attempt is: a failover chain shows the upstream that
+        // gave up and the one that served it, instead of collapsing both into a
+        // single row attributed to the wrong provider. `count_tokens` never
+        // reaches this loop (it returns above), so cheap estimation calls stay
+        // out of the view exactly as before.
+        let activity_id = state
+            .activity
+            .as_ref()
+            .map(|store| store.start(ActivityProtocol::Messages, &provider, &model));
         // Move the buffered body into the final attempt instead of cloning it: the
         // common single-upstream chain then never copies the (up to 64 MB) body,
         // and a multi-upstream chain only clones for the attempts that precede the
@@ -133,10 +146,26 @@ pub(super) async fn forward(
             Ok((status, mut response)) => {
                 stamp_gateway_headers(&mut response, &provider, &requested_model, &upstream_model);
                 if !is_advance_status(status) {
+                    let activity = settle_or_hand_off(
+                        &state,
+                        activity_id,
+                        &response,
+                        status.as_u16(),
+                        attempt_started_at.elapsed(),
+                    );
                     return Ok(observe_response(
-                        status, response, provider, model, started_at,
+                        status, response, provider, model, started_at, activity,
                     ));
                 }
+                // This attempt is failing over: settle its row now, since the
+                // response it produced is never handed to the client.
+                finish_activity(
+                    &state,
+                    activity_id,
+                    ActivityState::Error,
+                    Some(status.as_u16()),
+                    attempt_started_at.elapsed(),
+                );
                 tracing::warn!(
                     provider = %provider,
                     model = %model,
@@ -158,6 +187,17 @@ pub(super) async fn forward(
                     failure,
                 } = error;
                 stamp_gateway_headers(&mut response, &provider, &requested_model, &upstream_model);
+                // Every branch below ends this attempt — it either advances to
+                // the next upstream or returns the error to the client — and
+                // none of them yields a stream for the observer to settle, so
+                // the row is closed here once for all three.
+                finish_activity(
+                    &state,
+                    activity_id,
+                    ActivityState::Error,
+                    Some(response.status().as_u16()),
+                    attempt_started_at.elapsed(),
+                );
                 match failure {
                     Some(AdapterFailure::UpstreamStatus(raw_status))
                         if is_advance_status(raw_status) =>
@@ -209,6 +249,10 @@ pub(super) async fn forward(
                 failure.provider,
                 failure.model,
                 started_at,
+                // The attempt that produced this response already settled its
+                // own row when it advanced; relaying it after exhaustion must
+                // not reopen or double-settle it.
+                None,
             )),
             FinalResponse::MappedError { message, response } => Err(ForwardError {
                 message,
@@ -327,6 +371,7 @@ fn observe_response(
     provider: String,
     model: String,
     started_at: Instant,
+    activity: Option<ActivityFinish>,
 ) -> (StatusCode, axum::response::Response) {
     let response = crate::stream_metrics::observe_response(
         response,
@@ -334,8 +379,61 @@ fn observe_response(
         provider,
         model,
         started_at,
+        activity,
     );
     (status, response)
+}
+
+/// Close an activity row that has no stream lifetime left to observe. A no-op
+/// when the admin surface (and therefore the store) is disabled at boot.
+fn finish_activity(
+    state: &AppState,
+    id: Option<ActivityId>,
+    outcome: ActivityState,
+    status: Option<u16>,
+    header_latency: Duration,
+) {
+    if let (Some(store), Some(id)) = (state.activity.as_ref(), id) {
+        store.finish(id, outcome, status, Some(header_latency), None, None, None);
+    }
+}
+
+/// Decide who settles this attempt's activity row. A streaming response is
+/// handed to the stream observer, which closes the row on the stream's real
+/// terminal outcome (completed / upstream cut / client disconnect) rather than
+/// on the response head. A buffered response has no such lifetime, so it is
+/// settled here and the observer is given nothing.
+fn settle_or_hand_off(
+    state: &AppState,
+    id: Option<ActivityId>,
+    response: &axum::response::Response,
+    status: u16,
+    header_latency: Duration,
+) -> Option<ActivityFinish> {
+    let (store, id) = (state.activity.as_ref()?, id?);
+    if crate::stream_metrics::is_sse(response) {
+        return Some(ActivityFinish {
+            store: store.clone(),
+            id,
+            header_latency: Some(header_latency),
+            status,
+        });
+    }
+    let outcome = if status < 400 {
+        ActivityState::Completed
+    } else {
+        ActivityState::Error
+    };
+    store.finish(
+        id,
+        outcome,
+        Some(status),
+        Some(header_latency),
+        None,
+        None,
+        None,
+    );
+    None
 }
 
 fn is_advance_status(status: StatusCode) -> bool {
