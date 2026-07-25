@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod activity;
 pub mod adapters;
 pub mod admin;
 mod atomic_file;
