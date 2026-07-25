@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn parses_auth_json_for_api_key_mode() {
-        let dir = std::env::temp_dir().join("shunt-auth-json-api-key");
+        let dir = temp_auth_dir("auth-json-api-key");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("auth.json");
         std::fs::write(
