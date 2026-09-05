@@ -1493,6 +1493,22 @@ pub struct ProviderConfig {
     /// is used.
     #[serde(default)]
     pub workspace_roots: Vec<String>,
+    /// Private state directory for the Antigravity CLI child process
+    /// (`kind = "antigravity_cli"` only).
+    ///
+    /// `agy` resolves its whole state tree — credentials included — through
+    /// `HOME`, so pointing each provider entry at its own directory gives it
+    /// its own Google account and lets several be pooled concurrently. Ambient
+    /// `GOOGLE_*`/`GEMINI_*` variables are also stripped from the child
+    /// environment, so the gateway host's own configuration cannot silently
+    /// change which account — and whose billing — serves a request.
+    ///
+    /// Each directory needs its own one-time `agy` sign-in. Unset (the default)
+    /// preserves the previous behavior: the CLI inherits the gateway's
+    /// environment and its single ambient `~/.gemini` profile. A leading `~`
+    /// is expanded.
+    #[serde(default, deserialize_with = "deserialize_optional_credentials_path")]
+    pub profile_dir: Option<String>,
     /// Run the Antigravity CLI with `--sandbox` (`kind = "antigravity_cli"` only).
     ///
     /// On by default. Without it, `--dangerously-skip-permissions` leaves an
@@ -1708,7 +1724,7 @@ where
     Option::<String>::deserialize(deserializer).map(|path| path.map(|path| expand_tilde(&path)))
 }
 
-fn expand_tilde(path: &str) -> String {
+pub(crate) fn expand_tilde(path: &str) -> String {
     let Some(suffix) = path.strip_prefix("~/") else {
         return path.to_string();
     };
@@ -2367,6 +2383,7 @@ impl ProviderConfig {
             request_compression: true,
             retry: RetryConfig::default(),
             workspace_roots: Vec::new(),
+            profile_dir: None,
             sandbox: true,
         }
     }
@@ -2391,6 +2408,7 @@ impl ProviderConfig {
             request_compression: true,
             retry: RetryConfig::default(),
             workspace_roots: Vec::new(),
+            profile_dir: None,
             sandbox: true,
         }
     }
@@ -2415,6 +2433,7 @@ impl ProviderConfig {
             request_compression: true,
             retry: RetryConfig::default(),
             workspace_roots: Vec::new(),
+            profile_dir: None,
             sandbox: true,
         }
     }
@@ -2439,6 +2458,7 @@ impl ProviderConfig {
             request_compression: true,
             retry: RetryConfig::default(),
             workspace_roots: Vec::new(),
+            profile_dir: None,
             sandbox: true,
         }
     }
@@ -2485,6 +2505,7 @@ impl Default for Config {
                     request_compression: true,
                     retry: RetryConfig::default(),
                     workspace_roots: Vec::new(),
+                    profile_dir: None,
                     sandbox: true,
                 },
             ),
@@ -2557,6 +2578,7 @@ impl Default for Config {
                     request_compression: true,
                     retry: RetryConfig::default(),
                     workspace_roots: Vec::new(),
+                    profile_dir: None,
                     sandbox: true,
                 },
             ),
@@ -3872,6 +3894,14 @@ impl Config {
             .pool
             .as_ref()
             .and_then(PoolConfig::storm_ramp_initial)
+    }
+
+    /// Private `HOME` for `provider`'s Antigravity CLI child process, when
+    /// configured. See [`ProviderConfig::profile_dir`].
+    pub fn provider_profile_dir(&self, provider: &str) -> Option<&str> {
+        self.provider(provider)
+            .and_then(|config| config.profile_dir.as_deref())
+            .filter(|dir| !dir.is_empty())
     }
 
     /// Whether the Codex Responses WebSocket v2 transport should be used for

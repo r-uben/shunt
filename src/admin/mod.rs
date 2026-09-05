@@ -1874,6 +1874,7 @@ mod tests {
                 retry: Default::default(),
                 workspace_roots: Vec::new(),
                 sandbox: true,
+                profile_dir: None,
             },
         );
         let config = crate::config::Config {
